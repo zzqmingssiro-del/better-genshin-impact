@@ -57,14 +57,14 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
     // ==================== 私服补充树脂（自定义修改）开始 ====================
     // 私服的树脂详情弹窗永远显示“原粹树脂已完全恢复”，战前预检会误判为树脂充足，从而永远不会补充。
-    // 因此改为在征讨之花领奖界面兜底：按钮显示“补充原粹树脂”时，点击它并用脆弱树脂补充，
-    // 补充完成后退回游戏主界面，再重新交互征讨之花领取奖励。
+    // 因此改为在征讨之花领奖界面兜底：按钮显示“补充原粹树脂”时，点击它 → 脆弱树脂 → 使用 →
+    // 快捷使用界面把数量调到最大（20）→ 使用 → 点击“点击空白区域继续”，回到游戏主界面后再交互一次征讨之花领取奖励。
     // 下面几个开关改完需要重新编译。
 
     /// <summary>领奖界面出现“补充原粹树脂”时，是否自动用脆弱树脂补充并重新领取。</summary>
     private static readonly bool PrivateServerReplenishOnRewardPanel = true;
 
-    /// <summary>每次补充使用的脆弱树脂数量（快捷使用面板单次最多 20 个）。</summary>
+    /// <summary>每次补充使用的脆弱树脂数量（快捷使用界面单次最多 20 个）。</summary>
     private static readonly int PrivateServerFragileResinPerReplenish = 20;
 
     /// <summary>同一朵征讨之花最多补充几次，防止识别异常时无限消耗脆弱树脂。</summary>
@@ -1345,7 +1345,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
         while (!await TryUseOriginalResinOnRewardPrompt(page))
         {
-            // 私服补充：领奖按钮显示“补充原粹树脂”时，用脆弱树脂补充 → 退回游戏界面 → 重新交互征讨之花
+            // 私服：原有识别区域较窄，2K 等分辨率下可能认不全“使用原粹树脂”，用较宽的区域再试一次
+            if (PrivateServerReplenishOnRewardPanel && await TryClickUseOriginalResinWide(page))
+            {
+                break;
+            }
+
+            // 私服补充：领奖按钮显示“补充原粹树脂”时，点击补充 → 脆弱树脂 → 使用 20 个 → 回到游戏主界面 → 重新交互征讨之花
             if (PrivateServerReplenishOnRewardPanel
                 && replenishCount < PrivateServerMaxReplenishPerReward
                 && HasReplenishButtonOnRewardPanel(page))
@@ -1485,96 +1491,251 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     // ==================== 私服补充树脂（自定义修改）开始 ====================
 
     /// <summary>
+    /// 一次补充的结果。
+    /// </summary>
+    private enum PrivateServerReplenishOutcome
+    {
+        /// <summary>已确认使用了脆弱树脂（识别到了“获得”界面）。</summary>
+        Used,
+
+        /// <summary>已点击最后的“使用”，但没有识别到“获得”界面；是否成功交给领奖界面判断。</summary>
+        MaybeUsed,
+
+        /// <summary>补充界面里没有脆弱树脂（可能已经用完）。</summary>
+        NoFragileResin,
+
+        /// <summary>流程中途失败，没有使用脆弱树脂。</summary>
+        Failed
+    }
+
+    // 下面的区域和坐标都是 1080P 坐标（其他 16:9 分辨率会自动换算），按 2560x1440 实机截图校准。
+
+    /// <summary>领奖界面按钮（使用原粹树脂 / 补充原粹树脂）区域。</summary>
+    private Rect PrivateServerRewardButtonRect => ScaleRect(850, 730, 250, 60);
+
+    /// <summary>“补充原粹树脂”界面的标题区域。</summary>
+    private Rect PrivateServerSupplementTitleRect => ScaleRect(834, 247, 256, 60);
+
+    /// <summary>“补充原粹树脂”界面中，选中道具后显示道具名称的区域。</summary>
+    private Rect PrivateServerSupplementNameRect => ScaleRect(860, 578, 200, 46);
+
+    /// <summary>“补充原粹树脂”界面右下角“使用”按钮文字区域。</summary>
+    private Rect PrivateServerSupplementUseRect => ScaleRect(1100, 740, 190, 80);
+
+    /// <summary>“快捷使用”界面的标题区域。</summary>
+    private Rect PrivateServerQuickUseTitleRect => ScaleRect(875, 269, 184, 63);
+
+    /// <summary>“快捷使用”界面左上方道具名称区域。</summary>
+    private Rect PrivateServerQuickUseNameRect => ScaleRect(700, 345, 200, 60);
+
+    /// <summary>“快捷使用”界面右下角“使用”按钮文字区域。</summary>
+    private Rect PrivateServerQuickUseUseRect => ScaleRect(1090, 720, 190, 80);
+
+    /// <summary>“获得”界面顶部标题区域。</summary>
+    private Rect PrivateServerObtainTitleRect => ScaleRect(924, 279, 74, 38);
+
+    /// <summary>“获得”界面“点击空白区域继续”文字区域（在原粹树脂图标下方）。</summary>
+    private Rect PrivateServerObtainHintRect => ScaleRect(780, 712, 360, 76);
+
+    /// <summary>
     /// 判断征讨之花领奖界面的按钮是否显示为“补充原粹树脂”（即原粹树脂不足）。
     /// </summary>
     /// <param name="page">当前视觉定位页面。</param>
     private bool HasReplenishButtonOnRewardPanel(BvPage page)
     {
-        var buttonRect = ScaleRect(850, 730, 250, 60);
-        return page.Ocr(buttonRect).Any(region => region.Text.Contains("补充", StringComparison.Ordinal));
+        return page.Ocr(PrivateServerRewardButtonRect).Any(region => region.Text.Contains("补充", StringComparison.Ordinal));
     }
 
     /// <summary>
-    /// 在领奖界面用脆弱树脂补充原粹树脂，补充完成后退回游戏主界面，并重新交互征讨之花。
-    /// 本次补充失败（未使用任何脆弱树脂）且还有剩余次数时，也会重新交互，交给下一轮再试。
+    /// 判断征讨之花领奖界面是否打开（按钮显示“使用原粹树脂”或“补充原粹树脂”）。
+    /// 比原有识别区域更高一些，避免 2K 等分辨率下文字贴边识别不全。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    private bool IsRewardPanelOpen(BvPage page)
+    {
+        return page.Ocr(PrivateServerRewardButtonRect).Any(region => region.Text.Contains("原粹树脂", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 原有的“使用原粹树脂”识别区域较窄，2K 等分辨率下可能识别不全；这里用较宽的区域再找一次并点击。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <returns>找到并点击了“使用原粹树脂”时返回 true。</returns>
+    private async Task<bool> TryClickUseOriginalResinWide(BvPage page)
+    {
+        var locator = page.Locator("使用原粹树脂", PrivateServerRewardButtonRect);
+        if (!locator.IsExist())
+        {
+            return false;
+        }
+
+        try
+        {
+            await locator.ClickUntilDisappears(3000);
+            await Delay(1000, _ct);
+            _logger.LogInformation("{Name}：已点击“使用原粹树脂”", Name);
+            return true;
+        }
+        catch (TimeoutException e)
+        {
+            _logger.LogWarning("{Name}：点击“使用原粹树脂”失败，原因：{Reason}", Name, e.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 领奖界面显示“补充原粹树脂”时的处理：
+    /// 1. 点击“补充原粹树脂” → 进入“补充原粹树脂”界面（默认选中脆弱树脂）；
+    /// 2. 点击“使用” → 进入“快捷使用”界面，把数量调到最大（20）→ 点击“使用”；
+    /// 3. 出现“获得”界面 → 点击“点击空白区域继续”这行文字，游戏会自动回到游戏主界面；
+    /// 4. 确认已经回到游戏主界面（没有任何弹窗）；
+    /// 5. 原地重新交互征讨之花。
     /// </summary>
     /// <param name="page">当前视觉定位页面。</param>
     /// <param name="attempt">当前征讨之花的第几次补充。</param>
     /// <returns>已重新打开领奖界面、需要再次尝试领奖时返回 true；
-    /// 补充次数用尽或无法重新交互时返回 false（随后结束讨伐）。</returns>
+    /// 没有脆弱树脂、补充次数用尽、无法回到游戏主界面或无法重新交互时返回 false（随后结束讨伐）。</returns>
     private async Task<bool> TryReplenishOnRewardPanelAndReinteract(BvPage page, int attempt)
     {
         _logger.LogInformation("{Name}：领奖界面提示原粹树脂不足，第 {Attempt}/{Max} 次尝试使用 {Quantity} 个脆弱树脂补充",
             Name, attempt, PrivateServerMaxReplenishPerReward, PrivateServerFragileResinPerReplenish);
 
-        var usedQuantity = 0;
+        var outcome = PrivateServerReplenishOutcome.Failed;
+        var quantity = 0;
         try
         {
-            usedQuantity = await TryUseFragileResinFromRewardPanel(page);
+            (outcome, quantity) = await TryUseFragileResinFromRewardPanel(page);
         }
         catch (Exception e) when (e is not (OperationCanceledException or RetryException or NormalEndException))
         {
-            _logger.LogWarning(e, "{Name}：领奖界面补充脆弱树脂时出现异常", Name);
-        }
-        finally
-        {
-            // 无论补充是否成功，都先按 ESC 关闭补充面板和领奖界面，退回游戏主界面
-            await _returnMainUiTask.Start(_ct);
+            _logger.LogWarning(e, "{Name}：补充脆弱树脂时出现异常", Name);
         }
 
-        if (usedQuantity <= 0)
+        // 确认真正回到游戏主界面后才继续（还有弹窗会先关掉），避免在菜单里交互或移动角色
+        if (!await EnsureCleanMainUi(page, "补充树脂后"))
         {
-            if (attempt >= PrivateServerMaxReplenishPerReward)
-            {
-                _logger.LogWarning("{Name}：脆弱树脂补充失败（可能已经用完或未识别到补充面板），结束讨伐", Name);
+            return false;
+        }
+
+        switch (outcome)
+        {
+            case PrivateServerReplenishOutcome.Used:
+                _logger.LogInformation("{Name}：已使用 {Quantity} 个脆弱树脂补充原粹树脂，重新交互征讨之花", Name, quantity);
+                break;
+            case PrivateServerReplenishOutcome.MaybeUsed:
+                _logger.LogWarning("{Name}：已点击使用脆弱树脂，但未识别到“获得”界面，重新交互征讨之花确认是否补充成功", Name);
+                break;
+            case PrivateServerReplenishOutcome.NoFragileResin:
+                _logger.LogWarning("{Name}：没有可用的脆弱树脂，结束讨伐", Name);
                 return false;
+            default:
+                if (attempt >= PrivateServerMaxReplenishPerReward)
+                {
+                    _logger.LogWarning("{Name}：脆弱树脂补充失败，结束讨伐", Name);
+                    return false;
+                }
+
+                _logger.LogWarning("{Name}：本次脆弱树脂补充失败，重新交互征讨之花后再试一次", Name);
+                break;
+        }
+
+        await Delay(500, _ct);
+        return await ReinteractRewardFlower(page);
+    }
+
+    /// <summary>
+    /// 领奖界面 → 补充原粹树脂 → 脆弱树脂 → 使用 → 数量调到最大 → 使用 → 关闭“获得”界面。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <returns>补充结果和使用数量（数量识别不到时为 0）。</returns>
+    private async Task<(PrivateServerReplenishOutcome Outcome, int Quantity)> TryUseFragileResinFromRewardPanel(BvPage page)
+    {
+        // 1. 点击领奖界面的“补充原粹树脂”，打开“补充原粹树脂”界面
+        if (!await TryOpenSupplementPaneFromRewardPanel(page))
+        {
+            return (PrivateServerReplenishOutcome.Failed, 0);
+        }
+
+        // 2. 确认选中的是脆弱树脂（默认就是选中的，下方会显示“脆弱树脂”）；没选中时点击脆弱树脂图标
+        //    没确认是脆弱树脂时绝不点击“使用”，避免误用原石等其他道具
+        var fragileNameLocator = page.Locator("脆弱树脂", PrivateServerSupplementNameRect).WithRetryInterval(300);
+        if ((await fragileNameLocator.TryWaitFor(1500)).Count == 0)
+        {
+            var fragileResin = new SupplementalResinOption("脆弱树脂", LoadRecognitionObject("FragileResinInSupplementPane"));
+            var icons = await page.Locator(fragileResin.Template)
+                .WithRoi(ScaleRect(644, 378, 620, 192))
+                .WithRetryInterval(300)
+                .TryWaitFor(2000);
+            if (icons.Count == 0)
+            {
+                _logger.LogWarning("{Name}：补充界面里没有找到脆弱树脂（可能已经用完）", Name);
+                return (PrivateServerReplenishOutcome.NoFragileResin, 0);
             }
 
-            // 偶发的识别/点击失败：重新交互征讨之花，再尝试一次
-            _logger.LogWarning("{Name}：本次脆弱树脂补充失败，重新交互征讨之花后再试一次", Name);
-            await Delay(800, _ct);
-            return await ReinteractRewardFlower();
+            if (!await TrySelectSupplementalResin(page, fragileResin) || !fragileNameLocator.IsExist())
+            {
+                _logger.LogWarning("{Name}：未能确认已选中脆弱树脂，为避免误用其他道具，取消本次补充", Name);
+                return (PrivateServerReplenishOutcome.Failed, 0);
+            }
         }
 
-        _logger.LogInformation("{Name}：已使用 {Quantity} 个脆弱树脂补充原粹树脂，重新交互征讨之花", Name, usedQuantity);
-        await Delay(800, _ct);
-        return await ReinteractRewardFlower();
+        // 3. 点击“使用”，进入“快捷使用”界面
+        if (!await ClickPanelButton(page, "使用", PrivateServerSupplementUseRect, 1178, 781,
+                "补充原粹树脂", PrivateServerSupplementTitleRect))
+        {
+            return (PrivateServerReplenishOutcome.Failed, 0);
+        }
+
+        var quickUseTitles = await page.Locator("快捷使用", PrivateServerQuickUseTitleRect)
+            .WithRetryInterval(300)
+            .TryWaitFor(3000);
+        if (quickUseTitles.Count == 0)
+        {
+            // 没有出现选择数量的界面：可能直接使用了 1 个
+            if (await TryCloseObtainDialog(page))
+            {
+                return (PrivateServerReplenishOutcome.Used, 1);
+            }
+
+            _logger.LogWarning("{Name}：点击“使用”后没有出现“快捷使用”界面", Name);
+            return (PrivateServerReplenishOutcome.Failed, 0);
+        }
+
+        // 再次确认“快捷使用”的是脆弱树脂
+        if ((await page.Locator("脆弱树脂", PrivateServerQuickUseNameRect).WithRetryInterval(300).TryWaitFor(1500)).Count == 0)
+        {
+            _logger.LogWarning("{Name}：“快捷使用”界面未识别到脆弱树脂，为避免误用其他道具，取消本次补充", Name);
+            return (PrivateServerReplenishOutcome.Failed, 0);
+        }
+
+        // 4. 把使用数量调到最大
+        var quantity = await SetQuickUseQuantityToMax(page);
+
+        // 5. 点击“使用”
+        if (!await ClickPanelButton(page, "使用", PrivateServerQuickUseUseRect, 1164, 757,
+                "快捷使用", PrivateServerQuickUseTitleRect))
+        {
+            return (PrivateServerReplenishOutcome.Failed, 0);
+        }
+
+        // 6. “获得”界面：点击“点击空白区域继续”这行文字
+        if (await TryCloseObtainDialog(page))
+        {
+            return (PrivateServerReplenishOutcome.Used, quantity);
+        }
+
+        return (PrivateServerReplenishOutcome.MaybeUsed, quantity);
     }
 
     /// <summary>
-    /// 点击领奖界面的“补充原粹树脂”，在补充面板中选择脆弱树脂并按设定数量使用。
+    /// 点击领奖界面的“补充原粹树脂”按钮，直到出现“补充原粹树脂”界面。
     /// </summary>
     /// <param name="page">当前视觉定位页面。</param>
-    /// <returns>实际使用的脆弱树脂数量；失败返回 0。</returns>
-    private async Task<int> TryUseFragileResinFromRewardPanel(BvPage page)
+    /// <returns>“补充原粹树脂”界面已打开时返回 true。</returns>
+    private async Task<bool> TryOpenSupplementPaneFromRewardPanel(BvPage page)
     {
-        // 1. 打开“补充原粹树脂”面板
-        if (!await TryOpenResinSupplementPaneFromRewardPanel(page))
-        {
-            return 0;
-        }
-
-        // 2. 选中脆弱树脂（复用战前补充的图标模板和选中确认逻辑）
-        var fragileResin = new SupplementalResinOption("脆弱树脂", LoadRecognitionObject("FragileResinInSupplementPane"));
-        if (!await TrySelectSupplementalResin(page, fragileResin))
-        {
-            return 0;
-        }
-
-        // 3. 点击“使用”；出现快捷使用面板时点“+”把数量调到目标值（单次最多 20 个）再确认，最后关闭“获得”弹窗
-        return await TryUseSelectedSupplementalResin(page, fragileResin, PrivateServerFragileResinPerReplenish);
-    }
-
-    /// <summary>
-    /// 点击征讨之花领奖界面的“补充原粹树脂”按钮，直到出现补充原粹树脂面板；
-    /// 按钮点不开时，退回使用顶栏“+”号打开面板的原有逻辑。
-    /// </summary>
-    /// <param name="page">当前视觉定位页面。</param>
-    /// <returns>补充面板已打开时返回 true。</returns>
-    private async Task<bool> TryOpenResinSupplementPaneFromRewardPanel(BvPage page)
-    {
-        var titleLocator = page.Locator("补充原粹树脂", ScaleRect(834, 247, 256, 60)).WithRetryInterval(500);
-        var buttonLocator = page.Locator("补充原粹树脂", ScaleRect(850, 730, 250, 60));
+        var titleLocator = page.Locator("补充原粹树脂", PrivateServerSupplementTitleRect).WithRetryInterval(1000);
+        var buttonLocator = page.Locator("补充原粹树脂", PrivateServerRewardButtonRect);
 
         try
         {
@@ -1592,27 +1753,284 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         }
         catch (TimeoutException e)
         {
-            _logger.LogWarning("{Name}：点击“补充原粹树脂”后未出现补充面板，改用顶栏“+”号尝试，原因：{Reason}", Name, e.Message);
+            _logger.LogWarning("{Name}：点击“补充原粹树脂”后没有出现补充界面，原因：{Reason}", Name, e.Message);
+            return false;
         }
-
-        return await TryOpenResinSupplementPane(page);
     }
 
     /// <summary>
-    /// 退回游戏主界面后重新交互征讨之花：先原地等待“接触征讨之花”提示并按交互键；
-    /// 原地找不到时，使用原有的寻找征讨之花流程重新靠近并交互。
+    /// 点击弹窗中的按钮：先用 OCR 找按钮文字；没认出文字但确认还在该弹窗时，直接点击按钮的固定位置。
     /// </summary>
-    /// <returns>成功重新打开领奖界面时返回 true。</returns>
-    private async Task<bool> ReinteractRewardFlower()
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <param name="buttonText">按钮文字。</param>
+    /// <param name="textRect">按钮文字所在区域。</param>
+    /// <param name="fallbackX">按钮中心 X（1080P 坐标）。</param>
+    /// <param name="fallbackY">按钮中心 Y（1080P 坐标）。</param>
+    /// <param name="panelTitle">弹窗标题，用于确认还在该弹窗。</param>
+    /// <param name="panelTitleRect">弹窗标题区域。</param>
+    /// <returns>已点击按钮时返回 true。</returns>
+    private async Task<bool> ClickPanelButton(BvPage page, string buttonText, Rect textRect, double fallbackX, double fallbackY,
+        string panelTitle, Rect panelTitleRect)
     {
-        var page = new BvPage(_ct);
+        try
+        {
+            await page.Locator(buttonText, textRect).Click(3000);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            if (page.Locator(panelTitle, panelTitleRect).IsExist())
+            {
+                _logger.LogInformation("{Name}：未识别到“{Text}”按钮文字，按固定位置点击", Name, buttonText);
+                page.Click(fallbackX, fallbackY);
+                return true;
+            }
+
+            _logger.LogWarning("{Name}：没有找到“{Panel}”界面的“{Text}”按钮", Name, panelTitle, buttonText);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 在“快捷使用”界面把使用数量调到最大（不超过设定数量，单次最多 20 个）：
+    /// 先把滑块从最左端拖到滑条最右端，再点击右侧“+”号补足（到上限后再点不会增加），
+    /// 最后识别数量，不足时再补点“+”号。数量识别不到时不会卡住，直接继续。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <returns>识别到的使用数量；识别不到时返回 0。</returns>
+    private async Task<int> SetQuickUseQuantityToMax(BvPage page)
+    {
+        var target = Math.Min(PrivateServerFragileResinPerReplenish, MaxQuickUseQuantity);
+
+        // 滑条右端显示的是本次最多能用的数量（脆弱树脂不足 20 个时会更少）
+        var available = RecognizeQuickUseAvailableCount();
+        if (available > 0 && available < target)
+        {
+            target = available;
+        }
+
+        if (target >= MaxQuickUseQuantity || target == available)
+        {
+            // 方法一：把滑块（x=744）拖到滑条最右端（滑条终点约 x=1180，拖过头会停在最大值）
+            await DragQuickUseSlider(744, 1200, 648);
+        }
+
+        // 方法二：点击右侧“+”号（x=1292），数量从 1 开始，点 target-1 次
+        for (var i = 0; i < target - 1; i++)
+        {
+            page.Click(1292, 648);
+            await Delay(150, _ct);
+        }
+
+        // 识别数量，不足时补点“+”号（最多补 3 轮）
+        var quantity = 0;
+        for (var round = 0; round < 3; round++)
+        {
+            await Delay(400, _ct);
+            var recognized = TryRecognizeQuickUseQuantity();
+            if (recognized is not > 0)
+            {
+                break;
+            }
+
+            quantity = recognized.Value;
+            if (quantity >= target)
+            {
+                break;
+            }
+
+            for (var i = 0; i < target - quantity; i++)
+            {
+                page.Click(1292, 648);
+                await Delay(200, _ct);
+            }
+        }
+
+        if (quantity > 0)
+        {
+            _logger.LogInformation("{Name}：脆弱树脂使用数量 {Quantity}（目标 {Target}）", Name, quantity, target);
+            return quantity;
+        }
+
+        _logger.LogInformation("{Name}：已把脆弱树脂使用数量调到最大（目标 {Target}，数量未能识别）", Name, target);
+        return 0;
+    }
+
+    /// <summary>
+    /// 按住鼠标把“快捷使用”界面的滑块拖到指定位置（1080P 坐标）。
+    /// </summary>
+    private async Task DragQuickUseSlider(int fromX, int toX, int y)
+    {
+        try
+        {
+            GameCaptureRegion.GameRegion1080PPosMove(fromX, y);
+            await Delay(200, _ct);
+            Simulation.SendInput.Mouse.LeftButtonDown();
+            await Delay(150, _ct);
+            var step = fromX < toX ? 40 : -40;
+            for (var x = fromX; step > 0 ? x <= toX : x >= toX; x += step)
+            {
+                GameCaptureRegion.GameRegion1080PPosMove(x, y);
+                await Delay(30, _ct);
+            }
+
+            GameCaptureRegion.GameRegion1080PPosMove(toX, y);
+            await Delay(200, _ct);
+        }
+        finally
+        {
+            Simulation.SendInput.Mouse.LeftButtonUp();
+        }
+
+        await Delay(300, _ct);
+    }
+
+    /// <summary>
+    /// 关闭补充树脂后的“获得”界面：点击“点击空白区域继续”这行文字
+    /// （没认出文字时点击这行文字的固定位置），不会点到画面正中心的原粹树脂图标。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <returns>识别到“获得”界面并已关闭时返回 true；5 秒内没有出现“获得”界面时返回 false。</returns>
+    private async Task<bool> TryCloseObtainDialog(BvPage page)
+    {
+        var appeared = false;
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.ElapsedMilliseconds < 5000)
+        {
+            using (var capture = CaptureToRectArea())
+            {
+                if (IsObtainDialogOpen(capture))
+                {
+                    appeared = true;
+                    break;
+                }
+            }
+
+            await Delay(300, _ct);
+        }
+
+        if (!appeared)
+        {
+            _logger.LogWarning("{Name}：未识别到“获得”界面", Name);
+            return false;
+        }
+
+        for (var i = 0; i < 5; i++)
+        {
+            using (var capture = CaptureToRectArea())
+            {
+                if (!IsObtainDialogOpen(capture))
+                {
+                    return true;
+                }
+
+                var hint = FindOcrText(capture, PrivateServerObtainHintRect, "空白区域");
+                if (hint != null)
+                {
+                    hint.Click();
+                }
+                else
+                {
+                    page.Click(960, 748);
+                }
+            }
+
+            await Delay(800, _ct);
+        }
+
+        using var finalCapture = CaptureToRectArea();
+        return !IsObtainDialogOpen(finalCapture);
+    }
+
+    /// <summary>
+    /// 是否处于“获得”界面（底部“点击空白区域继续”或顶部“获得”标题）。
+    /// </summary>
+    private bool IsObtainDialogOpen(ImageRegion capture)
+    {
+        return FindOcrText(capture, PrivateServerObtainHintRect, "空白区域") != null
+               || FindOcrText(capture, PrivateServerObtainTitleRect, "获得") != null;
+    }
+
+    /// <summary>
+    /// 在截图的指定区域 OCR，返回第一个包含指定文字的区域。
+    /// </summary>
+    private static Region? FindOcrText(ImageRegion capture, Rect rect, string text)
+    {
+        return capture.FindMulti(RecognitionObject.Ocr(rect))
+            .FirstOrDefault(region => region.Text.Contains(text, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 确认已经真正回到游戏主界面：左上角派蒙图标可见，并且没有领奖界面、补充原粹树脂、快捷使用、“获得”等弹窗
+    /// （这些弹窗后面也能看到派蒙图标，原有的“返回主界面”会误以为已经回到主界面）。
+    /// 有“点击空白区域继续”时点击这行文字关闭，其余弹窗按 ESC 关闭。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <param name="stage">日志里显示的阶段名称。</param>
+    /// <returns>回到游戏主界面时返回 true；多次尝试仍未回到时返回 false（调用方会结束讨伐，不会再移动角色）。</returns>
+    private async Task<bool> EnsureCleanMainUi(BvPage page, string stage)
+    {
+        var unknownTimes = 0;
+        for (var i = 0; i < 15; i++)
+        {
+            _ct.ThrowIfCancellationRequested();
+            using (var capture = CaptureToRectArea())
+            {
+                var inMainUi = Bv.IsInMainUi(capture);
+                var hint = FindOcrText(capture, PrivateServerObtainHintRect, "空白区域");
+                var obtainTitle = FindOcrText(capture, PrivateServerObtainTitleRect, "获得");
+                var hasPanel = Bv.IsInBigMapUi(capture)
+                               || Bv.IsInAnyClosableUi(capture)
+                               || FindOcrText(capture, PrivateServerRewardButtonRect, "原粹树脂") != null
+                               || FindOcrText(capture, PrivateServerSupplementTitleRect, "补充原粹树脂") != null
+                               || FindOcrText(capture, PrivateServerQuickUseTitleRect, "快捷使用") != null;
+
+                if (inMainUi && hint == null && obtainTitle == null && !hasPanel)
+                {
+                    return true;
+                }
+
+                if (hint != null)
+                {
+                    // “获得”界面：点击“点击空白区域继续”这行文字
+                    hint.Click();
+                    unknownTimes = 0;
+                }
+                else if (obtainTitle != null)
+                {
+                    page.Click(960, 748);
+                    unknownTimes = 0;
+                }
+                else if (hasPanel || ++unknownTimes >= 2)
+                {
+                    // 未知界面先等一轮（可能是界面切换动画），连续两次仍不是主界面再按 ESC
+                    page.Keyboard.KeyPress(User32.VK.VK_ESCAPE);
+                    unknownTimes = 0;
+                }
+            }
+
+            await Delay(900, _ct);
+        }
+
+        _logger.LogWarning("{Name}：{Stage}多次尝试仍未回到游戏主界面，为避免在菜单里移动角色，结束讨伐", Name, stage);
+        return false;
+    }
+
+    /// <summary>
+    /// 在游戏主界面重新交互征讨之花：先原地等待“接触征讨之花”提示并按交互键；
+    /// 原地找不到时，先确认已回到游戏主界面，再使用原有的寻找征讨之花流程靠近并交互。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <returns>成功重新打开领奖界面时返回 true。</returns>
+    private async Task<bool> ReinteractRewardFlower(BvPage page)
+    {
         var stopwatch = Stopwatch.StartNew();
         var lastInteractAt = DateTime.MinValue;
 
         while (stopwatch.Elapsed < TimeSpan.FromSeconds(6))
         {
             _ct.ThrowIfCancellationRequested();
-            if (HasRewardPanelPrompt(page))
+            if (IsRewardPanelOpen(page))
             {
                 _logger.LogInformation("{Name}：已重新进入征讨之花领奖界面", Name);
                 return true;
@@ -1625,6 +2043,12 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             }
 
             await Delay(300, _ct);
+        }
+
+        // 重新寻找征讨之花会移动角色和视角，必须先确认已经回到游戏主界面
+        if (!await EnsureCleanMainUi(page, "重新寻找征讨之花前"))
+        {
+            return false;
         }
 
         _logger.LogInformation("{Name}：原地未找到“接触征讨之花”，重新寻找征讨之花", Name);
