@@ -55,6 +55,25 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     private static readonly TimeSpan OriginalResinRecoveryInterval = TimeSpan.FromMinutes(8);
     private const int MaxQuickUseQuantity = 20;
 
+    // ==================== 私服补充树脂（自定义修改）开始 ====================
+    // 私服的树脂详情弹窗永远显示“原粹树脂已完全恢复”，战前预检会误判为树脂充足，从而永远不会补充。
+    // 因此改为在征讨之花领奖界面兜底：按钮显示“补充原粹树脂”时，点击它并用脆弱树脂补充，
+    // 补充完成后退回游戏主界面，再重新交互征讨之花领取奖励。
+    // 下面几个开关改完需要重新编译。
+
+    /// <summary>领奖界面出现“补充原粹树脂”时，是否自动用脆弱树脂补充并重新领取。</summary>
+    private static readonly bool PrivateServerReplenishOnRewardPanel = true;
+
+    /// <summary>每次补充使用的脆弱树脂数量（快捷使用面板单次最多 20 个）。</summary>
+    private static readonly int PrivateServerFragileResinPerReplenish = 20;
+
+    /// <summary>同一朵征讨之花最多补充几次，防止识别异常时无限消耗脆弱树脂。</summary>
+    private static readonly int PrivateServerMaxReplenishPerReward = 2;
+
+    /// <summary>是否跳过每轮开战前的大地图树脂预检（私服预检结果不可信，跳过可省去每轮开关地图的时间）。</summary>
+    private static readonly bool PrivateServerSkipResinPreCheck = true;
+    // ==================== 私服补充树脂（自定义修改）结束 ====================
+
     private string PathingAssetFolder => Global.Absolute(@"GameTask\AutoBoss\Assets\Pathing");
 
     private double AssetScale => TaskContext.Instance().SystemInfo.AssetScale;
@@ -220,6 +239,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <returns>树脂足够或预检失败需要交由领奖弹窗兜底时返回 true；确认不足且无法补充时返回 false。</returns>
     private async Task<bool> EnsureResinBeforeRound()
     {
+        if (PrivateServerSkipResinPreCheck)
+        {
+            // 私服：跳过战前预检，树脂不足时交给领奖界面的“补充原粹树脂”流程处理
+            await _returnMainUiTask.Start(_ct);
+            return true;
+        }
+
         try
         {
             await _returnMainUiTask.Start(_ct);
@@ -1315,9 +1341,23 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     private async Task<bool> TakeReward()
     {
         var page = new BvPage(_ct);
+        var replenishCount = 0;
 
-        if (!await TryUseOriginalResinOnRewardPrompt(page))
+        while (!await TryUseOriginalResinOnRewardPrompt(page))
         {
+            // 私服补充：领奖按钮显示“补充原粹树脂”时，用脆弱树脂补充 → 退回游戏界面 → 重新交互征讨之花
+            if (PrivateServerReplenishOnRewardPanel
+                && replenishCount < PrivateServerMaxReplenishPerReward
+                && HasReplenishButtonOnRewardPanel(page))
+            {
+                replenishCount++;
+                if (await TryReplenishOnRewardPanelAndReinteract(page, replenishCount))
+                {
+                    // 已重新打开领奖界面，回到循环开头再次点击“使用原粹树脂”
+                    continue;
+                }
+            }
+
             await CloseResinSupplementPrompt(page);
             await _returnMainUiTask.Start(_ct);
             return false;
@@ -1441,6 +1481,166 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
         throw new TimeoutException("关闭补充原粹树脂提示超时");
     }
+
+    // ==================== 私服补充树脂（自定义修改）开始 ====================
+
+    /// <summary>
+    /// 判断征讨之花领奖界面的按钮是否显示为“补充原粹树脂”（即原粹树脂不足）。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    private bool HasReplenishButtonOnRewardPanel(BvPage page)
+    {
+        var buttonRect = ScaleRect(850, 730, 250, 60);
+        return page.Ocr(buttonRect).Any(region => region.Text.Contains("补充", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 在领奖界面用脆弱树脂补充原粹树脂，补充完成后退回游戏主界面，并重新交互征讨之花。
+    /// 本次补充失败（未使用任何脆弱树脂）且还有剩余次数时，也会重新交互，交给下一轮再试。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <param name="attempt">当前征讨之花的第几次补充。</param>
+    /// <returns>已重新打开领奖界面、需要再次尝试领奖时返回 true；
+    /// 补充次数用尽或无法重新交互时返回 false（随后结束讨伐）。</returns>
+    private async Task<bool> TryReplenishOnRewardPanelAndReinteract(BvPage page, int attempt)
+    {
+        _logger.LogInformation("{Name}：领奖界面提示原粹树脂不足，第 {Attempt}/{Max} 次尝试使用 {Quantity} 个脆弱树脂补充",
+            Name, attempt, PrivateServerMaxReplenishPerReward, PrivateServerFragileResinPerReplenish);
+
+        var usedQuantity = 0;
+        try
+        {
+            usedQuantity = await TryUseFragileResinFromRewardPanel(page);
+        }
+        catch (Exception e) when (e is not (OperationCanceledException or RetryException or NormalEndException))
+        {
+            _logger.LogWarning(e, "{Name}：领奖界面补充脆弱树脂时出现异常", Name);
+        }
+        finally
+        {
+            // 无论补充是否成功，都先按 ESC 关闭补充面板和领奖界面，退回游戏主界面
+            await _returnMainUiTask.Start(_ct);
+        }
+
+        if (usedQuantity <= 0)
+        {
+            if (attempt >= PrivateServerMaxReplenishPerReward)
+            {
+                _logger.LogWarning("{Name}：脆弱树脂补充失败（可能已经用完或未识别到补充面板），结束讨伐", Name);
+                return false;
+            }
+
+            // 偶发的识别/点击失败：重新交互征讨之花，再尝试一次
+            _logger.LogWarning("{Name}：本次脆弱树脂补充失败，重新交互征讨之花后再试一次", Name);
+            await Delay(800, _ct);
+            return await ReinteractRewardFlower();
+        }
+
+        _logger.LogInformation("{Name}：已使用 {Quantity} 个脆弱树脂补充原粹树脂，重新交互征讨之花", Name, usedQuantity);
+        await Delay(800, _ct);
+        return await ReinteractRewardFlower();
+    }
+
+    /// <summary>
+    /// 点击领奖界面的“补充原粹树脂”，在补充面板中选择脆弱树脂并按设定数量使用。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <returns>实际使用的脆弱树脂数量；失败返回 0。</returns>
+    private async Task<int> TryUseFragileResinFromRewardPanel(BvPage page)
+    {
+        // 1. 打开“补充原粹树脂”面板
+        if (!await TryOpenResinSupplementPaneFromRewardPanel(page))
+        {
+            return 0;
+        }
+
+        // 2. 选中脆弱树脂（复用战前补充的图标模板和选中确认逻辑）
+        var fragileResin = new SupplementalResinOption("脆弱树脂", LoadRecognitionObject("FragileResinInSupplementPane"));
+        if (!await TrySelectSupplementalResin(page, fragileResin))
+        {
+            return 0;
+        }
+
+        // 3. 点击“使用”；出现快捷使用面板时点“+”把数量调到目标值（单次最多 20 个）再确认，最后关闭“获得”弹窗
+        return await TryUseSelectedSupplementalResin(page, fragileResin, PrivateServerFragileResinPerReplenish);
+    }
+
+    /// <summary>
+    /// 点击征讨之花领奖界面的“补充原粹树脂”按钮，直到出现补充原粹树脂面板；
+    /// 按钮点不开时，退回使用顶栏“+”号打开面板的原有逻辑。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <returns>补充面板已打开时返回 true。</returns>
+    private async Task<bool> TryOpenResinSupplementPaneFromRewardPanel(BvPage page)
+    {
+        var titleLocator = page.Locator("补充原粹树脂", ScaleRect(834, 247, 256, 60)).WithRetryInterval(500);
+        var buttonLocator = page.Locator("补充原粹树脂", ScaleRect(850, 730, 250, 60));
+
+        try
+        {
+            await titleLocator
+                .WithRetryAction(_ =>
+                {
+                    var buttons = buttonLocator.FindAll();
+                    if (buttons.Count > 0)
+                    {
+                        buttons[0].Click();
+                    }
+                })
+                .WaitFor(6000);
+            return true;
+        }
+        catch (TimeoutException e)
+        {
+            _logger.LogWarning("{Name}：点击“补充原粹树脂”后未出现补充面板，改用顶栏“+”号尝试，原因：{Reason}", Name, e.Message);
+        }
+
+        return await TryOpenResinSupplementPane(page);
+    }
+
+    /// <summary>
+    /// 退回游戏主界面后重新交互征讨之花：先原地等待“接触征讨之花”提示并按交互键；
+    /// 原地找不到时，使用原有的寻找征讨之花流程重新靠近并交互。
+    /// </summary>
+    /// <returns>成功重新打开领奖界面时返回 true。</returns>
+    private async Task<bool> ReinteractRewardFlower()
+    {
+        var page = new BvPage(_ct);
+        var stopwatch = Stopwatch.StartNew();
+        var lastInteractAt = DateTime.MinValue;
+
+        while (stopwatch.Elapsed < TimeSpan.FromSeconds(6))
+        {
+            _ct.ThrowIfCancellationRequested();
+            if (HasRewardPanelPrompt(page))
+            {
+                _logger.LogInformation("{Name}：已重新进入征讨之花领奖界面", Name);
+                return true;
+            }
+
+            if (HasRewardInteractionPrompt(page) && DateTime.UtcNow - lastInteractAt >= TimeSpan.FromMilliseconds(1000))
+            {
+                Simulation.SendInput.SimulateAction(GIActions.PickUpOrInteract);
+                lastInteractAt = DateTime.UtcNow;
+            }
+
+            await Delay(300, _ct);
+        }
+
+        _logger.LogInformation("{Name}：原地未找到“接触征讨之花”，重新寻找征讨之花", Name);
+        try
+        {
+            await NavigateToReward();
+            return true;
+        }
+        catch (TimeoutException e)
+        {
+            _logger.LogWarning("{Name}：重新交互征讨之花失败，原因：{Reason}", Name, e.Message);
+            return false;
+        }
+    }
+
+    // ==================== 私服补充树脂（自定义修改）结束 ====================
 
     /// <summary>
     /// 关闭领奖结果页面，等待回到主界面。
