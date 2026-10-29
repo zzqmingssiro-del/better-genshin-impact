@@ -59,6 +59,8 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     // 私服的树脂详情弹窗永远显示“原粹树脂已完全恢复”，战前预检会误判为树脂充足，从而永远不会补充。
     // 因此改为在征讨之花领奖界面兜底：按钮显示“补充原粹树脂”时，点击它 → 脆弱树脂 → 使用 →
     // 快捷使用界面把数量调到最大（20）→ 使用 → 点击“点击空白区域继续”，回到游戏主界面后再交互一次征讨之花领取奖励。
+    // 另外，私服领奖结果页的“点击空白区域继续”就在奖励图标正下方，原来的关闭方法只在画面最下方找这行字，
+    // 找不到时会点击屏幕正中间，正好点到奖励图标、弹出物品详情而卡住；现在改为在画面下半部分找到这行字并点击它。
     // 下面几个开关改完需要重新编译。
 
     /// <summary>领奖界面出现“补充原粹树脂”时，是否自动用脆弱树脂补充并重新领取。</summary>
@@ -72,6 +74,9 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
     /// <summary>是否跳过每轮开战前的大地图树脂预检（私服预检结果不可信，跳过可省去每轮开关地图的时间）。</summary>
     private static readonly bool PrivateServerSkipResinPreCheck = true;
+
+    /// <summary>领奖后是否用私服版方法关闭奖励结果页（点击“点击空白区域继续”这行字，绝不点击画面中间的奖励图标）。</summary>
+    private static readonly bool PrivateServerSafeCloseRewardResult = true;
     // ==================== 私服补充树脂（自定义修改）结束 ====================
 
     private string PathingAssetFolder => Global.Absolute(@"GameTask\AutoBoss\Assets\Pathing");
@@ -1370,7 +1375,16 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         }
 
         await TryRecognizeRewardResult(page);
-        await CloseRewardResult();
+        if (PrivateServerSafeCloseRewardResult)
+        {
+            // 私服：点击“点击空白区域继续”这行字关闭奖励结果页，不点击画面中间的奖励图标（会弹出物品详情而卡住）
+            await PrivateServerCloseRewardResult(page);
+        }
+        else
+        {
+            await CloseRewardResult();
+        }
+
         Notify.Event("AutoBoss").Success($"{Name}奖励领取");
         return true;
     }
@@ -1531,11 +1545,20 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <summary>“快捷使用”界面右下角“使用”按钮文字区域。</summary>
     private Rect PrivateServerQuickUseUseRect => ScaleRect(1090, 720, 190, 80);
 
-    /// <summary>“获得”界面顶部标题区域。</summary>
-    private Rect PrivateServerObtainTitleRect => ScaleRect(924, 279, 74, 38);
+    /// <summary>“获得”界面 / 领奖结果页顶部“获得”标题区域。</summary>
+    private Rect PrivateServerObtainTitleRect => ScaleRect(840, 240, 240, 110);
 
-    /// <summary>“获得”界面“点击空白区域继续”文字区域（在原粹树脂图标下方）。</summary>
-    private Rect PrivateServerObtainHintRect => ScaleRect(780, 712, 360, 76);
+    /// <summary>
+    /// “点击空白区域继续”文字的查找范围：画面下半部分的一大块区域（奖励图标下方）。
+    /// 私服上这行字紧挨在图标下方（y≈748），官方版在画面最下方（y≈977），两种位置都能找到。
+    /// </summary>
+    private Rect PrivateServerObtainHintRect => ScaleRect(460, 680, 1000, 390);
+
+    /// <summary>找不到“点击空白区域继续”时点击的空白处（1080P 坐标）：在奖励图标下方，不会点到任何图标。</summary>
+    private const int PrivateServerBlankClickX = 960;
+
+    /// <summary>找不到“点击空白区域继续”时点击的空白处（1080P 坐标）。</summary>
+    private const int PrivateServerBlankClickY = 900;
 
     /// <summary>
     /// 判断征讨之花领奖界面的按钮是否显示为“补充原粹树脂”（即原粹树脂不足）。
@@ -1931,7 +1954,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 }
                 else
                 {
-                    page.Click(960, 748);
+                    page.Click(PrivateServerBlankClickX, PrivateServerBlankClickY);
                 }
             }
 
@@ -1998,7 +2021,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 }
                 else if (obtainTitle != null)
                 {
-                    page.Click(960, 748);
+                    page.Click(PrivateServerBlankClickX, PrivateServerBlankClickY);
                     unknownTimes = 0;
                 }
                 else if (hasPanel || ++unknownTimes >= 2)
@@ -2061,6 +2084,80 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         {
             _logger.LogWarning("{Name}：重新交互征讨之花失败，原因：{Reason}", Name, e.Message);
             return false;
+        }
+    }
+
+    /// <summary>
+    /// 关闭领奖结果页（私服版）。
+    /// 原来的关闭方法只在画面最下方找“点击空白区域继续”，私服上这行字在奖励图标正下方，找不到时它会点击屏幕正中间，
+    /// 正好点到奖励图标、弹出物品详情，任务就卡住了。
+    /// 这里改为：在画面下半部分的大范围内找这行字并点击它；一直找不到时，只点击奖励图标下方的空白处，绝不点击画面中间。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <exception cref="Exception">30 秒内仍未回到游戏主界面时抛出（和原来一样结束任务）。</exception>
+    private async Task PrivateServerCloseRewardResult(BvPage page)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var seenResult = false;
+        var mainUiTimes = 0;
+        var lastBlankClick = TimeSpan.Zero;
+
+        while (stopwatch.Elapsed < TimeSpan.FromSeconds(30))
+        {
+            _ct.ThrowIfCancellationRequested();
+            using (var capture = CaptureToRectArea())
+            {
+                var hint = FindOcrText(capture, PrivateServerObtainHintRect, "空白区域");
+                if (hint != null)
+                {
+                    // 点击“点击空白区域继续”这行字
+                    seenResult = true;
+                    mainUiTimes = 0;
+                    hint.Click();
+                    await Delay(1000, _ct);
+                    continue;
+                }
+
+                var hasTitle = FindOcrText(capture, PrivateServerObtainTitleRect, "获得") != null;
+                if (hasTitle)
+                {
+                    seenResult = true;
+                }
+
+                if (!hasTitle && Bv.IsInMainUi(capture)
+                              && FindOcrText(capture, PrivateServerRewardButtonRect, "原粹树脂") == null)
+                {
+                    // 已经看到过奖励结果页：连续 2 次确认回到游戏主界面即可；
+                    // 还没看到过：奖励结果页可能还没弹出来，多等一会儿再确认
+                    mainUiTimes++;
+                    if ((seenResult && mainUiTimes >= 2) || mainUiTimes >= 8)
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    mainUiTimes = 0;
+
+                    // 不在游戏主界面，又找不到“点击空白区域继续”：先等奖励动画播完；
+                    // 超过 5 秒后，每隔约 1.5 秒点击一次奖励图标下方的空白处（万一弹出了物品详情，也能把它关掉）
+                    if (stopwatch.Elapsed > TimeSpan.FromSeconds(5)
+                        && stopwatch.Elapsed - lastBlankClick > TimeSpan.FromMilliseconds(1500))
+                    {
+                        _logger.LogInformation("{Name}：未识别到“点击空白区域继续”，点击奖励下方的空白处", Name);
+                        page.Click(PrivateServerBlankClickX, PrivateServerBlankClickY);
+                        lastBlankClick = stopwatch.Elapsed;
+                    }
+                }
+            }
+
+            await Delay(300, _ct);
+        }
+
+        using var finalCapture = CaptureToRectArea();
+        if (!Bv.IsInMainUi(finalCapture))
+        {
+            throw new Exception("领取奖励后未成功回到主界面");
         }
     }
 
