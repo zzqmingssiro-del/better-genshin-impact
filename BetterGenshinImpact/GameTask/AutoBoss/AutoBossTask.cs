@@ -79,6 +79,78 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     private static readonly bool PrivateServerSafeCloseRewardResult = true;
     // ==================== 私服补充树脂（自定义修改）结束 ====================
 
+    // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）开关 ====================
+    // 私服每个首领每周最多领取 100 次。征讨之花提示“本周收取该宝藏次数已耗尽”时，
+    // 自动打开冒险之证 → 讨伐 → 首领，按列表顺序（从左到右、从上到下）选中红框标记的下一个首领，
+    // 点击“前往”→“传送并追踪”，再用 BetterGI 自带的路线前往并继续讨伐。
+    // 需要先完成前置任务的、附近没有解锁传送锚点的、BetterGI 不支持的、写在跳过名单（User\私服跳过的首领.txt）里的首领会自动跳过。
+    // 另外，有些首领的征讨之花头顶没有图标，原来的找花方法找不到就会结束任务；现在找不到图标时改为按花身上的红色花纹寻找。
+    // 下面几个开关改完需要重新编译。
+
+    /// <summary>征讨之花提示“本周收取该宝藏次数已耗尽”时，是否按冒险之证首领列表顺序自动换下一个首领继续讨伐（关闭时直接结束任务）。</summary>
+    private static readonly bool PrivateServerBossRotation = true;
+
+    /// <summary>任务开始时是否先打开冒险之证，从红框标记的首领开始讨伐（开启后 BetterGI 界面里选择的首领只在识别失败时使用）。</summary>
+    private static readonly bool PrivateServerStartFromHandbookSelection = true;
+
+    /// <summary>在冒险之证选好首领后，是否点击“前往”→“传送并追踪”（追踪该首领），之后再走 BetterGI 自带的路线。</summary>
+    private static readonly bool PrivateServerHandbookTeleportAndTrack = true;
+
+    /// <summary>征讨之花头顶没有图标时，是否改为按征讨之花身上的红色花纹寻找（还找不到时回到首领位置再找一次）。</summary>
+    private static readonly bool PrivateServerFindFlowerWithoutIcon = true;
+
+    /// <summary>本轮在征讨之花处看到了“本周收取该宝藏次数已耗尽”。</summary>
+    private volatile bool _psWeeklyLimitReached;
+
+    /// <summary>任务开始时是否已经按冒险之证选择过首领（角色死亡重试时不再重复选择）。</summary>
+    private bool _psStartSelectionDone;
+
+    /// <summary>最近一次看到征讨之花（头顶图标或红色花纹）的时间（UTC Ticks）。</summary>
+    private long _psRewardTargetSeenTicks;
+
+    /// <summary>附近找不到征讨之花时，允许像原来一样边转视角边往前走。</summary>
+    private volatile bool _psRewardBlindWalk;
+
+    /// <summary>
+    /// 首领轮换时要跳过的首领名单文件（在 BetterGI 安装目录的 User 文件夹里，和你的配置放在一起）。
+    /// 用记事本修改后保存即可，下次换首领时生效，不需要重新编译。文件不存在时会按下面的默认内容自动创建。
+    /// </summary>
+    private const string PrivateServerSkippedBossFileName = @"User\私服跳过的首领.txt";
+
+    /// <summary>
+    /// 跳过名单文件的默认内容：每行一个首领名字（写名字的一部分也可以），一行里 # 后面的内容不生效。
+    /// </summary>
+    private static readonly string[] PrivateServerSkippedBossFileDefaultLines =
+    [
+        "# 私服首领轮换：这个名单里的首领会被自动跳过。",
+        "# 每行写一个首领名字。写名字的一部分也可以，例如“无相之”会跳过所有无相系列的首领。",
+        "# 一行里 # 后面的内容不生效（是说明文字）：在行首加 # 就是不跳过这个首领，删掉行首的 # 就是跳过。",
+        "# 用记事本修改后保存即可，下次换首领时生效，不需要重新编译 BetterGI。",
+        "# 需要先完成前置任务的首领、附近没有解锁传送锚点的首领、BetterGI 不支持的首领，程序会自动跳过，不用写在这里。",
+        "",
+        "# ===== 你要求跳过的 =====",
+        "重拳出击鸭        # 喜欢乱跑，停在首领区域边上",
+        "贪食匿叶龙山王    # 私服有 bug，首领刷在场地边上",
+        "冰风组曲          # 需要先对话才能开打",
+        "歌裴莉娅的葬送    # 冰风组曲（BetterGI 里的名字）",
+        "科培琉司的劫罚    # 冰风组曲（BetterGI 里的名字）",
+        "无相之            # 无相系列：无相之雷、无相之岩、无相之火、无相之水、无相之草等",
+        "魔偶剑鬼          # 一直下雨，再加上冰伤会被冻住",
+        "纯水精灵          # 太拖沓，地板会下潜，打不到天上飞的怪",
+        "",
+        "# ===== 建议考虑跳过的（默认不跳过，删掉行首的 # 就会跳过）=====",
+        "# 蕴光月守宫              # BetterGI 标注：所在的分层地图还不支持路径追踪，只能用键鼠宏走过去，比较容易出问题",
+        "# 蕴光月幻蝶              # 同上",
+        "# 超重型陆巡舰·机动战垒   # 同上",
+        "# 雷音权现                # 会瞬移、飞到空中，近战容易打不到（和纯水精灵的问题类似）",
+        "# 风蚀沙虫                # 会钻进沙子里到处跑（和重拳出击鸭的问题类似）",
+        "# 兆载永劫龙兽            # 会飞到空中，近战容易打不到",
+    ];
+
+    /// <summary>本次任务是否已经在日志里列出过跳过名单。</summary>
+    private bool _psSkipListLogged;
+    // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）开关结束 ====================
+
     private string PathingAssetFolder => Global.Absolute(@"GameTask\AutoBoss\Assets\Pathing");
 
     private double AssetScale => TaskContext.Instance().SystemInfo.AssetScale;
@@ -127,6 +199,9 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         _ct = ct;
         _rewardSummary.Clear();
         _successfulRewardCount = 0;
+        _psWeeklyLimitReached = false;
+        _psStartSelectionDone = false;
+        _psSkipListLogged = false;
         Validate();
         LogScreenResolution();
 
@@ -171,6 +246,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     {
         // 1.切换队伍
         await Prepare();
+
+        // 私服：任务开始时，从冒险之证红框标记的首领开始讨伐
+        if (PrivateServerBossRotation && PrivateServerStartFromHandbookSelection && !_psStartSelectionDone)
+        {
+            _psStartSelectionDone = true;
+            await PrivateServerPickStartBossFromHandbook();
+        }
         
         var shouldNavigateToBoss = true;
         //2.根据剩余次数判断是否继续
@@ -195,11 +277,34 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             //5.开始战斗
             await RunAutoFight();
             
-            //6.寻路到征讨之花
-            await NavigateToReward();
+            //6.寻路到征讨之花（私服：找不到时回到首领位置再找一次）
+            await PrivateServerNavigateToReward();
+
+            // 私服：征讨之花提示“本周收取该宝藏次数已耗尽” → 按冒险之证的顺序换下一个首领
+            if (_psWeeklyLimitReached)
+            {
+                if (!await PrivateServerHandleWeeklyLimit())
+                {
+                    break;
+                }
+
+                shouldNavigateToBoss = true;
+                continue;
+            }
             
             //7.交互征讨之花
             var rewardSuccess = await TakeReward();
+            // 私服：征讨之花提示“本周收取该宝藏次数已耗尽” → 按冒险之证的顺序换下一个首领
+            if (_psWeeklyLimitReached)
+            {
+                if (!await PrivateServerHandleWeeklyLimit())
+                {
+                    break;
+                }
+
+                shouldNavigateToBoss = true;
+                continue;
+            }
             if (!rewardSuccess)
             {
                 _logger.LogInformation("{Name}：原粹树脂不足或无法领取奖励，结束任务", Name);
@@ -1151,7 +1256,10 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         _logger.LogInformation("{Name}：开始寻找征讨之花", Name);
 
         var navigationStopwatch = Stopwatch.StartNew();
-        var navigationTimeout = TimeSpan.FromSeconds(20);
+        // 私服：头顶没有图标的征讨之花需要更长的寻找时间
+        var navigationTimeout = TimeSpan.FromSeconds(PrivateServerFindFlowerWithoutIcon ? 45 : 20);
+        Interlocked.Exchange(ref _psRewardTargetSeenTicks, 0);
+        _psRewardBlindWalk = !PrivateServerFindFlowerWithoutIcon;
         var adjustCameraTask = AdjustRewardCameraTask(page, navigationCts);
         var moveToRewardTask = MoveToRewardTask(page, navigationCts);
         var monitorRewardPromptTask = MonitorRewardPromptTask(page, navigationCts);
@@ -1171,6 +1279,12 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 if (completedTask == monitorRewardPromptTask)
                 {
                     await monitorRewardPromptTask;
+                    if (_psWeeklyLimitReached)
+                    {
+                        _logger.LogInformation("{Name}：征讨之花提示“本周收取该宝藏次数已耗尽”", Name);
+                        return;
+                    }
+
                     _logger.LogInformation("{Name}：已进入征讨之花领奖界面", Name);
                     return;
                 }
@@ -1229,6 +1343,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 return;
             }
 
+            // 私服：按下交互键后提示“本周收取该宝藏次数已耗尽”（不会弹出领奖界面）
+            if (DateTime.UtcNow - lastInteractAt < TimeSpan.FromSeconds(4) && HasWeeklyLimitToast(page))
+            {
+                _psWeeklyLimitReached = true;
+                return;
+            }
+
             if (HasRewardInteractionPrompt(page))
             {
                 if (DateTime.UtcNow - lastInteractAt >= TimeSpan.FromMilliseconds(300))
@@ -1251,6 +1372,8 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         var maxTargetX = captureRect.Width * 0.55;
         var centerX = captureRect.Width / 2.0;
         var halfHeight = captureRect.Height / 2.0;
+        // 私服：头顶没有图标时的寻找状态
+        var flowerSearch = new PrivateServerFlowerSearchState();
 
         while (!ct.IsCancellationRequested)
         {
@@ -1258,6 +1381,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             var boxRegions = page.Locator(LoadRecognitionObject("RewardBox")).FindAll();
             if (boxRegions.Count < 1)
             {
+                // 私服：转了一圈仍没有头顶图标时，改为按征讨之花的红色花纹寻找
+                if (PrivateServerFindFlowerWithoutIcon
+                    && await PrivateServerSteerToFlowerWithoutIcon(flowerSearch, centerX, ct))
+                {
+                    continue;
+                }
+
                 _logger.LogWarning("{Name}：未找到征讨之花图标，调整视角重试", Name);
                 Simulation.SendInput.Mouse.MoveMouseBy(ScaleX(200), 0);
                 await Delay(250, ct);
@@ -1265,6 +1395,8 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             }
 
             var icon = boxRegions[0];
+            Interlocked.Exchange(ref _psRewardTargetSeenTicks, DateTime.UtcNow.Ticks);
+            flowerSearch.ResetRotation();
 
             if (icon.Y > halfHeight)
             {
@@ -1310,6 +1442,20 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                     Simulation.SendInput.SimulateAction(GIActions.MoveLeft, KeyType.KeyDown);
                     await Delay(800, ct);
                     Simulation.SendInput.SimulateAction(GIActions.MoveLeft, KeyType.KeyUp);
+                    continue;
+                }
+
+                // 私服：还没看到征讨之花（头顶图标或红色花纹）时先原地转视角寻找，不盲目往前走
+                if (PrivateServerFindFlowerWithoutIcon && !_psRewardBlindWalk
+                    && DateTime.UtcNow.Ticks - Interlocked.Read(ref _psRewardTargetSeenTicks) > TimeSpan.FromSeconds(1.5).Ticks)
+                {
+                    if (isMovingForward)
+                    {
+                        Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+                        isMovingForward = false;
+                    }
+
+                    await Delay(200, ct);
                     continue;
                 }
 
@@ -1369,6 +1515,12 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 }
             }
 
+            if (HasWeeklyLimitToast(page))
+            {
+                // 私服：提示“本周收取该宝藏次数已耗尽”
+                _psWeeklyLimitReached = true;
+            }
+
             await CloseResinSupplementPrompt(page);
             await _returnMainUiTask.Start(_ct);
             return false;
@@ -1383,6 +1535,11 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         else
         {
             await CloseRewardResult();
+        }
+
+        if (_psWeeklyLimitReached)
+        {
+            return false;
         }
 
         Notify.Event("AutoBoss").Success($"{Name}奖励领取");
@@ -2124,6 +2281,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                     seenResult = true;
                 }
 
+                if (!seenResult && !_psWeeklyLimitReached && HasWeeklyLimitToast(capture))
+                {
+                    // 私服：领奖时提示“本周收取该宝藏次数已耗尽”（没有发放奖励）
+                    _psWeeklyLimitReached = true;
+                    _logger.LogInformation("{Name}：领奖时提示“本周收取该宝藏次数已耗尽”", Name);
+                }
+
                 if (!hasTitle && Bv.IsInMainUi(capture)
                               && FindOcrText(capture, PrivateServerRewardButtonRect, "原粹树脂") == null)
                 {
@@ -2162,6 +2326,1275 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     }
 
     // ==================== 私服补充树脂（自定义修改）结束 ====================
+
+    // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）开始 ====================
+
+    // ---------- 界面坐标（1080P 基准，按用户截图测量） ----------
+
+    /// <summary>“本周收取该宝藏次数已耗尽”提示的识别区域（画面上方中间）。</summary>
+    private static readonly Rect PrivateServerWeeklyLimitToastRect = new(610, 175, 700, 80);
+
+    /// <summary>冒险之证最左侧一栏（见闻/委托/秘境/讨伐/向导/备战）的识别区域。</summary>
+    private static readonly Rect PrivateServerHandbookTabRect = new(200, 190, 200, 600);
+
+    /// <summary>讨伐页左页上方筛选下拉框当前值（全部/普通/精英/首领/其他）的识别区域。</summary>
+    private static readonly Rect PrivateServerHandbookFilterRect = new(390, 180, 250, 50);
+
+    /// <summary>筛选下拉框展开后选项列表的识别区域。</summary>
+    private static readonly Rect PrivateServerHandbookFilterListRect = new(390, 232, 250, 280);
+
+    /// <summary>冒险之证右页上方首领名字的识别区域。</summary>
+    private static readonly Rect PrivateServerHandbookTitleRect = new(1030, 245, 560, 65);
+
+    /// <summary>冒险之证右页“前往”按钮的识别区域。</summary>
+    private static readonly Rect PrivateServerHandbookGotoRect = new(1380, 800, 200, 85);
+
+    /// <summary>大地图右侧首领面板“传送并追踪”按钮的识别区域。</summary>
+    private static readonly Rect PrivateServerMapTeleportTrackRect = new(1560, 960, 340, 90);
+
+    /// <summary>筛选下拉框的所有选项。</summary>
+    private static readonly string[] PrivateServerHandbookFilterNames = ["全部", "普通", "精英", "首领", "其他"];
+
+    /// <summary>首领列表三列图标中心的 X 坐标。</summary>
+    private static readonly int[] PrivateServerGridColumnX = [500, 682, 865];
+
+    /// <summary>首领列表相邻两行图标中心的垂直距离。</summary>
+    private const int PrivateServerGridRowPitch = 164;
+
+    /// <summary>首领列表可见区域的上边界。</summary>
+    private const int PrivateServerGridTop = 245;
+
+    /// <summary>首领列表可见区域的下边界。</summary>
+    private const int PrivateServerGridBottom = 885;
+
+    /// <summary>点击图标前，图标中心需要在这个范围内（完整可见）。</summary>
+    private const int PrivateServerGridSafeTop = 300;
+
+    /// <summary>点击图标前，图标中心需要在这个范围内（完整可见）。</summary>
+    private const int PrivateServerGridSafeBottom = 800;
+
+    /// <summary>用来判断首领列表滚动了多少的区域。</summary>
+    private static readonly Rect PrivateServerGridScrollRect = new(405, 250, 540, 630);
+
+    /// <summary>红框（当前选中的首领）所在圆环的半径。</summary>
+    private static readonly int[] PrivateServerRingRadii = [66, 68, 70];
+
+    /// <summary>识别征讨之花红色花纹时忽略的区域：上方按钮、小地图、队伍列表、下方血条/技能、角色本身。</summary>
+    private static readonly Rect[] PrivateServerFlowerIgnoreRects =
+    [
+        new(0, 0, 1920, 110), new(0, 0, 330, 320), new(1560, 230, 360, 400),
+        new(0, 960, 1920, 120), new(1600, 880, 320, 200), new(840, 280, 240, 700)
+    ];
+
+    /// <summary>按红色花纹找花时，把花放在画面的这个位置（相对画面中心的比例：1180/960，即角色右侧一点）。</summary>
+    private const double PrivateServerFlowerAimRatio = 1180.0 / 960.0;
+
+    /// <summary>花在这个范围内（1080P 下 x 1100～1260）时不再转动视角。</summary>
+    private const double PrivateServerFlowerAimMinRatio = 1100.0 / 960.0;
+
+    /// <summary>花在这个范围内（1080P 下 x 1100～1260）时不再转动视角。</summary>
+    private const double PrivateServerFlowerAimMaxRatio = 1260.0 / 960.0;
+
+    /// <summary>判定为征讨之花所需的最少红色像素（在缩小到 960×540 的画面上统计）。</summary>
+    private const int PrivateServerFlowerMinRedPixels = 60;
+
+    /// <summary>识别首领名字时忽略的符号（OCR 可能把“·”认成其他点号）。</summary>
+    private const string PrivateServerNameIgnoredChars = "·・•．.。‧∙⋅･-－—「」『』\"'“”";
+
+    private enum PrivateServerHandbookStepResult
+    {
+        Selected,
+        EndOfList,
+        Failed
+    }
+
+    private readonly record struct PrivateServerGridCell(int Col, double Y, double Score);
+
+    private readonly record struct PrivateServerHandbookStep(PrivateServerHandbookStepResult Result, int Col, double Y);
+
+    /// <summary>冒险之证“前往”→“传送并追踪”的结果。</summary>
+    private enum PrivateServerTeleportResult
+    {
+        /// <summary>已传送并回到游戏主界面。</summary>
+        Teleported,
+
+        /// <summary>大地图上显示“追踪并引导”：附近没有解锁的传送锚点。</summary>
+        NoWaypoint,
+
+        /// <summary>冒险之证右页没有找到“前往”（还在冒险之证里）。</summary>
+        NoGotoButton,
+
+        /// <summary>其他原因没有完成传送。</summary>
+        Failed
+    }
+
+    /// <summary>冒险之证里当前选中的首领能不能刷。</summary>
+    private enum PrivateServerCandidateResult
+    {
+        /// <summary>就刷这个首领。</summary>
+        Selected,
+
+        /// <summary>跳过，继续在冒险之证里点下一个。</summary>
+        Skip,
+
+        /// <summary>跳过，但已经离开了冒险之证（打开过大地图），需要重新打开冒险之证再点下一个。</summary>
+        SkipAndReopen
+    }
+
+    /// <summary>
+    /// 寻找无图标征讨之花时的状态：先转一圈找头顶图标，找不到再按红色花纹找，还找不到就边走边找。
+    /// </summary>
+    private sealed class PrivateServerFlowerSearchState
+    {
+        public bool ColorPhase;
+        public double RotatedDegrees;
+        public int Steps;
+        public float? LastAngle;
+        public DateTime LastLogAt = DateTime.MinValue;
+
+        public void Track(float? angle)
+        {
+            if (angle is null)
+            {
+                return;
+            }
+
+            if (LastAngle is { } last)
+            {
+                var diff = Math.Abs(angle.Value - last) % 360;
+                if (diff > 180)
+                {
+                    diff = 360 - diff;
+                }
+
+                // 忽略偶尔识别错误造成的大跳变
+                if (diff < 90)
+                {
+                    RotatedDegrees += diff;
+                }
+            }
+
+            LastAngle = angle;
+        }
+
+        public void ResetRotation()
+        {
+            RotatedDegrees = 0;
+            Steps = 0;
+            LastAngle = null;
+        }
+    }
+
+    private Rect ScaleRect(Rect rect)
+    {
+        return ScaleRect(rect.X, rect.Y, rect.Width, rect.Height);
+    }
+
+    /// <summary>
+    /// 画面上方中间是否显示“本周收取该宝藏次数已耗尽”。
+    /// </summary>
+    private bool HasWeeklyLimitToast(BvPage page)
+    {
+        return page.Ocr(ScaleRect(PrivateServerWeeklyLimitToastRect))
+            .Any(region => region.Text.Contains("已耗尽", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 画面上方中间是否显示“本周收取该宝藏次数已耗尽”。
+    /// </summary>
+    private bool HasWeeklyLimitToast(ImageRegion capture)
+    {
+        return FindOcrText(capture, ScaleRect(PrivateServerWeeklyLimitToastRect), "已耗尽") != null;
+    }
+
+    /// <summary>
+    /// 寻找征讨之花；超时找不到时（例如头顶没有图标、花在视野外），先回到首领路线终点附近，再找一次。
+    /// </summary>
+    private async Task PrivateServerNavigateToReward()
+    {
+        try
+        {
+            await NavigateToReward();
+        }
+        catch (TimeoutException e) when (PrivateServerFindFlowerWithoutIcon && !AutoBossData.IsNoPathingSupportBoss(_taskParam.BossName))
+        {
+            _logger.LogWarning("{Name}：{Message}，回到首领位置后再找一次征讨之花", Name, e.Message);
+            if (!await EnsureCleanMainUi(new BvPage(_ct), "重新寻找征讨之花前"))
+            {
+                throw;
+            }
+
+            await PrivateServerWalkToBossPosition();
+            await NavigateToReward();
+        }
+    }
+
+    /// <summary>
+    /// 走到当前首领“前往”路线的终点（首领所在位置）。
+    /// </summary>
+    private async Task PrivateServerWalkToBossPosition()
+    {
+        var routePath = BuildPathingAssetPath($"{_taskParam.BossName}前往.json");
+        var originalTask = PathingTask.BuildFromFilePath(routePath) ?? throw new Exception($"路径文件解析失败：{routePath}");
+        var lastPosition = originalTask.Positions.LastOrDefault() ?? throw new Exception("路线文件缺少路径点");
+        var walkTask = new PathingTask
+        {
+            Info = originalTask.Info,
+            Config = originalTask.Config,
+            Positions = [lastPosition]
+        };
+
+        _logger.LogInformation("{Name}：回到 {Boss} 的位置", Name, _taskParam.BossName);
+        await RunPathingTask(walkTask);
+    }
+
+    /// <summary>
+    /// 头顶图标找不到时的处理。返回 true 表示已经按红色花纹调整了视角（调用方继续下一轮）；
+    /// 返回 false 表示调用方按原来的方式转动视角继续找。
+    /// </summary>
+    private async Task<bool> PrivateServerSteerToFlowerWithoutIcon(PrivateServerFlowerSearchState state, double centerX, CancellationToken ct)
+    {
+        using var capture = CaptureToRectArea();
+        state.Track(PrivateServerTryGetCameraAngle(capture));
+        state.Steps++;
+        var fullTurn = state.RotatedDegrees >= 360 || state.Steps >= 50;
+
+        if (!state.ColorPhase)
+        {
+            if (!fullTurn)
+            {
+                // 先像原来一样转一圈找头顶的图标
+                return false;
+            }
+
+            state.ColorPhase = true;
+            state.ResetRotation();
+            fullTurn = false;
+            _logger.LogInformation("{Name}：转了一圈没有找到征讨之花头顶的图标，改为按征讨之花的红色花纹寻找", Name);
+        }
+
+        if (PrivateServerTryFindFlowerByColor(capture, out var flowerX, out var redPixels))
+        {
+            Interlocked.Exchange(ref _psRewardTargetSeenTicks, DateTime.UtcNow.Ticks);
+            state.ResetRotation();
+            if (DateTime.UtcNow - state.LastLogAt > TimeSpan.FromSeconds(3))
+            {
+                state.LastLogAt = DateTime.UtcNow;
+                _logger.LogInformation("{Name}：按红色花纹找到了征讨之花（{Pixels} 个红色像素），正在靠近", Name, redPixels);
+            }
+
+            // 花是场景里的实物，正对画面中间时会被角色挡住（角色所在区域也不参与识别），
+            // 所以把花放在角色右侧一点（1080P 下 x≈1180）再往前走，角色会绕一个小弧线走到花跟前
+            var aimX = centerX * PrivateServerFlowerAimRatio;
+            if (flowerX < centerX * PrivateServerFlowerAimMinRatio || flowerX > centerX * PrivateServerFlowerAimMaxRatio)
+            {
+                Simulation.SendInput.Mouse.MoveMouseBy((int)Math.Round(flowerX - aimX), 0);
+            }
+
+            await Delay(250, ct);
+            return true;
+        }
+
+        if (fullTurn && !_psRewardBlindWalk)
+        {
+            _psRewardBlindWalk = true;
+            _logger.LogWarning("{Name}：附近也没有找到征讨之花的红色花纹，改为边转视角边往前走寻找", Name);
+        }
+
+        return false;
+    }
+
+    private static float? PrivateServerTryGetCameraAngle(ImageRegion capture)
+    {
+        try
+        {
+            return BetterGenshinImpact.GameTask.Common.Map.CameraOrientation.Compute(capture.SrcMat);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 按征讨之花茎和花苞上的暗红色花纹寻找征讨之花（头顶没有图标时使用）。
+    /// 忽略界面按钮、小地图、队伍列表和角色本身所在的区域；红色像素需要足够多且集中在一处。
+    /// </summary>
+    /// <param name="capture">当前截图。</param>
+    /// <param name="targetX">征讨之花在截图中的 X 坐标。</param>
+    /// <param name="redPixels">红色像素数量（缩小到 960×540 后统计）。</param>
+    private static bool PrivateServerTryFindFlowerByColor(ImageRegion capture, out double targetX, out int redPixels)
+    {
+        targetX = 0;
+        redPixels = 0;
+        var src = capture.SrcMat;
+        if (src.Empty() || src.Width < 2 || src.Height < 2)
+        {
+            return false;
+        }
+
+        using var bgr = PrivateServerCropBgr(src, new Rect(0, 0, src.Width, src.Height));
+        using var small = new Mat();
+        Cv2.Resize(bgr, small, new Size(bgr.Width / 2, bgr.Height / 2), 0, 0, InterpolationFlags.Area);
+        using var hsv = new Mat();
+        Cv2.CvtColor(small, hsv, ColorConversionCodes.BGR2HSV);
+        using var low = new Mat();
+        using var high = new Mat();
+        using var mask = new Mat();
+        Cv2.InRange(hsv, new Scalar(0, 90, 45), new Scalar(8, 255, 230), low);
+        Cv2.InRange(hsv, new Scalar(165, 90, 45), new Scalar(180, 255, 230), high);
+        Cv2.BitwiseOr(low, high, mask);
+
+        // 1080P 坐标 → 缩小后的坐标
+        var k = small.Width / 1920.0;
+        var bounds = new Rect(0, 0, mask.Width, mask.Height);
+        foreach (var r in PrivateServerFlowerIgnoreRects)
+        {
+            var scaled = new Rect((int)(r.X * k), (int)(r.Y * k), (int)Math.Ceiling(r.Width * k) + 1, (int)Math.Ceiling(r.Height * k) + 1) & bounds;
+            if (scaled.Width <= 0 || scaled.Height <= 0)
+            {
+                continue;
+            }
+
+            using var sub = new Mat(mask, scaled);
+            sub.SetTo(Scalar.Black);
+        }
+
+        redPixels = Cv2.CountNonZero(mask);
+        var minPixels = (int)Math.Round(PrivateServerFlowerMinRedPixels * k * k * 4);
+        if (redPixels < Math.Max(minPixels, 20))
+        {
+            return false;
+        }
+
+        using var points = new Mat();
+        Cv2.FindNonZero(mask, points);
+        if (points.Empty())
+        {
+            return false;
+        }
+
+        points.GetArray(out Point[] pts);
+        if (pts.Length == 0)
+        {
+            return false;
+        }
+
+        var meanX = pts.Average(p => (double)p.X);
+        var band = 160 * k;
+        var concentrated = pts.Count(p => Math.Abs(p.X - meanX) <= band) / (double)pts.Length;
+        if (concentrated < 0.6)
+        {
+            return false;
+        }
+
+        targetX = meanX / small.Width * src.Width;
+        return true;
+    }
+
+    /// <summary>
+    /// 从截图中裁剪一块区域并统一转成 3 通道 BGR。
+    /// </summary>
+    private static Mat PrivateServerCropBgr(Mat src, Rect rect)
+    {
+        using var crop = new Mat(src, rect);
+        var bgr = new Mat();
+        if (crop.Channels() == 4)
+        {
+            Cv2.CvtColor(crop, bgr, ColorConversionCodes.BGRA2BGR);
+        }
+        else if (crop.Channels() == 1)
+        {
+            Cv2.CvtColor(crop, bgr, ColorConversionCodes.GRAY2BGR);
+        }
+        else
+        {
+            crop.CopyTo(bgr);
+        }
+
+        return bgr;
+    }
+
+    /// <summary>
+    /// 本周该首领的领取次数已用完：开启首领轮换时，按冒险之证顺序换下一个首领；否则结束任务。
+    /// </summary>
+    /// <returns>已换到下一个首领时返回 true；需要结束任务时返回 false。</returns>
+    private async Task<bool> PrivateServerHandleWeeklyLimit()
+    {
+        _psWeeklyLimitReached = false;
+        _logger.LogInformation("{Name}：{Boss} 本周的领取次数已用完（本周收取该宝藏次数已耗尽）", Name, _taskParam.BossName);
+        if (!PrivateServerBossRotation)
+        {
+            _logger.LogInformation("{Name}：没有开启首领轮换，结束任务", Name);
+            return false;
+        }
+
+        var nextBoss = await PrivateServerSelectBossInHandbook(advance: true);
+        if (nextBoss == null)
+        {
+            return false;
+        }
+
+        _logger.LogInformation("{Name}：换成讨伐 {Boss}", Name, nextBoss);
+        _taskParam.BossName = nextBoss;
+        return true;
+    }
+
+    /// <summary>
+    /// 任务开始时，从冒险之证红框标记的首领开始讨伐。
+    /// </summary>
+    private async Task PrivateServerPickStartBossFromHandbook()
+    {
+        _logger.LogInformation("{Name}：打开冒险之证，从红框标记的首领开始讨伐", Name);
+        var boss = await PrivateServerSelectBossInHandbook(advance: false);
+        if (boss == null)
+        {
+            _logger.LogWarning("{Name}：没能从冒险之证确定要讨伐的首领，继续讨伐界面里选择的首领：{Boss}", Name, _taskParam.BossName);
+            return;
+        }
+
+        if (boss != _taskParam.BossName)
+        {
+            _logger.LogInformation("{Name}：冒险之证红框标记的首领是 {Boss}，改为讨伐它（界面里选择的是 {UiBoss}）", Name, boss, _taskParam.BossName);
+        }
+
+        _taskParam.BossName = boss;
+    }
+
+    /// <summary>
+    /// 在冒险之证“讨伐 → 首领”列表里选择要讨伐的首领，并（按开关）点击“前往”→“传送并追踪”。
+    /// 会跳过：需要先完成前置任务的、在跳过名单里的、BetterGI 不支持的、附近没有解锁传送锚点的首领。
+    /// </summary>
+    /// <param name="advance">false：使用红框标记的首领（不能刷时往后找）；true：从红框标记的下一个首领开始找。</param>
+    /// <returns>选中的首领名称；列表已经到末尾或操作失败时返回 null。</returns>
+    private async Task<string?> PrivateServerSelectBossInHandbook(bool advance)
+    {
+        var skipList = PrivateServerLoadSkippedBosses();
+        var reopened = false;
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            var (reopen, boss) = await PrivateServerSelectBossInHandbookOnce(advance, reopened, skipList);
+            if (!reopen)
+            {
+                return boss;
+            }
+
+            // 刚才的首领附近没有解锁的传送锚点：大地图已经关掉，红框停在这个首领上，重新打开冒险之证从它的下一个开始找
+            advance = true;
+            reopened = true;
+        }
+
+        _logger.LogWarning("{Name}：连续跳过的首领太多，停止在冒险之证里寻找", Name);
+        return null;
+    }
+
+    /// <summary>
+    /// 打开一次冒险之证选择首领，结束时关闭冒险之证 / 大地图回到游戏主界面。
+    /// </summary>
+    /// <returns>Reopen 为 true：刚才的首领附近没有解锁的传送锚点，需要重新打开冒险之证继续找；
+    /// 否则 Boss 为选中的首领（null 表示列表已经到末尾或操作失败）。</returns>
+    private async Task<(bool Reopen, string? Boss)> PrivateServerSelectBossInHandbookOnce(bool advance, bool reopened, IReadOnlyList<string> skipList)
+    {
+        var page = new BvPage(_ct);
+        try
+        {
+            if (!await PrivateServerOpenHandbookBossList(page))
+            {
+                _logger.LogWarning("{Name}：打开冒险之证首领列表失败", Name);
+                return (false, null);
+            }
+
+            var title = await PrivateServerReadHandbookTitle(null);
+            _logger.LogInformation("{Name}：冒险之证当前红框标记的首领：{Title}", Name, title ?? "（没有识别到名字）");
+
+            if (!advance)
+            {
+                var first = await PrivateServerEvaluateHandbookCandidate(page, title, skipList, isNext: false);
+                if (first.Result == PrivateServerCandidateResult.Selected)
+                {
+                    return (false, first.Boss);
+                }
+
+                if (first.Result == PrivateServerCandidateResult.SkipAndReopen)
+                {
+                    return (true, null);
+                }
+            }
+            else if (!reopened)
+            {
+                var titleBoss = title == null ? null : PrivateServerMatchSupportedBoss(title);
+                if (titleBoss != null && titleBoss != _taskParam.BossName)
+                {
+                    _logger.LogWarning("{Name}：冒险之证红框标记的首领（{Title}）和刚才讨伐的首领（{Boss}）不一样，按红框的顺序继续", Name, titleBoss, _taskParam.BossName);
+                }
+            }
+
+            var selected = await PrivateServerLocateSelectedCell();
+            if (selected == null)
+            {
+                _logger.LogWarning("{Name}：冒险之证首领列表里找不到红框标记的首领", Name);
+                return (false, null);
+            }
+
+            var (col, y) = selected.Value;
+            var previousTitle = title;
+            for (var i = 0; i < 80; i++)
+            {
+                var step = await PrivateServerSelectNextCell(page, col, y);
+                if (step.Result == PrivateServerHandbookStepResult.EndOfList)
+                {
+                    if (advance)
+                    {
+                        _logger.LogInformation("{Name}：已经是冒险之证首领列表的最后一个了，列表里的首领本周都已讨伐完毕（不能刷的首领已跳过），结束任务", Name);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("{Name}：冒险之证首领列表里，红框之后已经没有能刷的首领了", Name);
+                    }
+
+                    return (false, null);
+                }
+
+                if (step.Result == PrivateServerHandbookStepResult.Failed)
+                {
+                    _logger.LogWarning("{Name}：在冒险之证里选择下一个首领失败", Name);
+                    return (false, null);
+                }
+
+                (col, y) = (step.Col, step.Y);
+                var name = await PrivateServerReadHandbookTitle(previousTitle);
+                if (name != null)
+                {
+                    previousTitle = name;
+                }
+
+                var candidate = await PrivateServerEvaluateHandbookCandidate(page, name, skipList, isNext: true);
+                if (candidate.Result == PrivateServerCandidateResult.Selected)
+                {
+                    return (false, candidate.Boss);
+                }
+
+                if (candidate.Result == PrivateServerCandidateResult.SkipAndReopen)
+                {
+                    return (true, null);
+                }
+            }
+
+            return (false, null);
+        }
+        catch (Exception e) when (e is not (OperationCanceledException or NormalEndException or RetryException))
+        {
+            _logger.LogWarning("{Name}：冒险之证操作出错：{Message}", Name, e.Message);
+            return (false, null);
+        }
+        finally
+        {
+            // 关闭冒险之证 / 大地图，回到游戏主界面
+            if (!_ct.IsCancellationRequested)
+            {
+                await EnsureCleanMainUi(page, "冒险之证操作结束后");
+            }
+        }
+    }
+
+    private bool PrivateServerRouteFilesExist(string boss)
+    {
+        return GetRequiredRouteFiles(boss).All(route => File.Exists(BuildPathingAssetPath(route)));
+    }
+
+    /// <summary>
+    /// 判断冒险之证当前选中的首领能不能刷。需要先完成前置任务的、在跳过名单里的、BetterGI 不支持的、缺少路线文件的首领直接跳过；
+    /// 能刷时（按开关）点击“前往”→“传送并追踪”。大地图上显示“追踪并引导”（附近没有解锁的传送锚点）时也跳过。
+    /// </summary>
+    /// <param name="page">当前页面。</param>
+    /// <param name="title">右页识别到的首领名字（没有识别到时为 null）。</param>
+    /// <param name="skipList">跳过名单。</param>
+    /// <param name="isNext">是否是红框之后的首领（只影响日志）。</param>
+    private async Task<(PrivateServerCandidateResult Result, string? Boss)> PrivateServerEvaluateHandbookCandidate(BvPage page, string? title,
+        IReadOnlyList<string> skipList, bool isNext)
+    {
+        // 右页下方的按钮是“前置任务”而不是“前往”：还没有完成前置任务（这种首领的名字也显示成问号）
+        var buttonText = await PrivateServerWaitText(PrivateServerHandbookGotoRect, ["前往", "前置"], 1500, click: false);
+        if (buttonText != null && buttonText.Contains("前置", StringComparison.Ordinal))
+        {
+            _logger.LogInformation("{Name}：跳过需要先完成前置任务的首领：{Title}", Name, title ?? "（名字还没解锁）");
+            return (PrivateServerCandidateResult.Skip, null);
+        }
+
+        var boss = title == null ? null : PrivateServerMatchSupportedBoss(title);
+        if (PrivateServerFindSkipKeyword(skipList, title, boss) != null)
+        {
+            _logger.LogInformation("{Name}：按跳过名单跳过首领：{Title}", Name, boss ?? title);
+            return (PrivateServerCandidateResult.Skip, null);
+        }
+
+        if (boss == null)
+        {
+            _logger.LogInformation("{Name}：跳过 BetterGI 暂不支持的首领：{Title}", Name, title ?? "（没有识别到名字）");
+            return (PrivateServerCandidateResult.Skip, null);
+        }
+
+        if (!PrivateServerRouteFilesExist(boss))
+        {
+            _logger.LogInformation("{Name}：跳过缺少路线文件的首领：{Boss}", Name, boss);
+            return (PrivateServerCandidateResult.Skip, null);
+        }
+
+        if (isNext)
+        {
+            _logger.LogInformation("{Name}：冒险之证已选中下一个首领：{Boss}", Name, boss);
+        }
+
+        if (!PrivateServerHandbookTeleportAndTrack)
+        {
+            return (PrivateServerCandidateResult.Selected, boss);
+        }
+
+        var teleport = await PrivateServerClickGotoAndTeleport(page);
+        if (teleport == PrivateServerTeleportResult.NoWaypoint)
+        {
+            _logger.LogInformation("{Name}：{Boss} 附近没有解锁的传送锚点（大地图上显示“追踪并引导”），跳过，回到冒险之证选下一个", Name, boss);
+            return (PrivateServerCandidateResult.SkipAndReopen, null);
+        }
+
+        if (teleport == PrivateServerTeleportResult.Teleported)
+        {
+            _logger.LogInformation("{Name}：已通过冒险之证“传送并追踪” {Boss}", Name, boss);
+        }
+        else
+        {
+            _logger.LogWarning("{Name}：冒险之证“传送并追踪”没有完成，直接用 BetterGI 自带的路线前往 {Boss}", Name, boss);
+        }
+
+        return (PrivateServerCandidateResult.Selected, boss);
+    }
+
+    /// <summary>
+    /// 读取跳过首领名单（User\私服跳过的首领.txt）。文件不存在时按默认内容创建；读取失败时使用默认名单。
+    /// 每次换首领时都会重新读取，所以运行中修改名单也会在下次换首领时生效。
+    /// </summary>
+    private IReadOnlyList<string> PrivateServerLoadSkippedBosses()
+    {
+        var path = Global.Absolute(PrivateServerSkippedBossFileName);
+        IEnumerable<string> lines;
+        try
+        {
+            if (!File.Exists(path))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllText(path, string.Join("\r\n", PrivateServerSkippedBossFileDefaultLines) + "\r\n", new System.Text.UTF8Encoding(true));
+                _logger.LogInformation("{Name}：已创建跳过首领名单：{Path}", Name, path);
+            }
+
+            lines = File.ReadAllLines(path);
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("{Name}：读取跳过首领名单失败（{Message}），使用默认名单", Name, e.Message);
+            lines = PrivateServerSkippedBossFileDefaultLines;
+        }
+
+        var list = PrivateServerParseSkippedBosses(lines);
+        if (!_psSkipListLogged)
+        {
+            _psSkipListLogged = true;
+            _logger.LogInformation("{Name}：首领轮换会跳过这些首领：{List}（名单可以用记事本修改：{Path}）", Name,
+                list.Count == 0 ? "（无）" : string.Join("、", list), path);
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// 解析跳过名单：每行一个名字，# 或 ＃ 后面的内容不生效；忽略空格和“·”等符号；少于 2 个字的忽略。
+    /// </summary>
+    private static List<string> PrivateServerParseSkippedBosses(IEnumerable<string> lines)
+    {
+        var list = new List<string>();
+        foreach (var line in lines)
+        {
+            var text = line;
+            var comment = text.IndexOfAny(new[] { '#', '＃' });
+            if (comment >= 0)
+            {
+                text = text[..comment];
+            }
+
+            var name = PrivateServerNormalizeBossName(text);
+            if (name.Length >= 2 && !list.Contains(name))
+            {
+                list.Add(name);
+            }
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// 冒险之证里的名字或对应的 BetterGI 首领名称包含跳过名单里的某一项时，返回这一项；否则返回 null。
+    /// </summary>
+    private static string? PrivateServerFindSkipKeyword(IReadOnlyList<string> keywords, string? title, string? boss)
+    {
+        var normalizedTitle = title == null ? string.Empty : PrivateServerNormalizeBossName(title);
+        var normalizedBoss = boss == null ? string.Empty : PrivateServerNormalizeBossName(boss);
+        foreach (var keyword in keywords)
+        {
+            if ((normalizedTitle.Length > 0 && normalizedTitle.Contains(keyword, StringComparison.Ordinal))
+                || (normalizedBoss.Length > 0 && normalizedBoss.Contains(keyword, StringComparison.Ordinal)))
+            {
+                return keyword;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 打开冒险之证 → 点击最左侧的“讨伐” → 左页上方的下拉框选择“首领”。
+    /// </summary>
+    private async Task<bool> PrivateServerOpenHandbookBossList(BvPage page)
+    {
+        if (!await EnsureCleanMainUi(page, "打开冒险之证前"))
+        {
+            return false;
+        }
+
+        var tabClicked = false;
+        for (var attempt = 0; attempt < 2 && !tabClicked; attempt++)
+        {
+            Simulation.SendInput.SimulateAction(GIActions.OpenAdventurerHandbook);
+            await Delay(1000, _ct);
+            tabClicked = await PrivateServerWaitText(PrivateServerHandbookTabRect, ["讨伐"], 4000, click: true) != null;
+            if (!tabClicked && attempt == 0 && !await EnsureCleanMainUi(page, "重新打开冒险之证前"))
+            {
+                return false;
+            }
+        }
+
+        if (!tabClicked)
+        {
+            _logger.LogWarning("{Name}：没有找到冒险之证最左侧的“讨伐”", Name);
+            return false;
+        }
+
+        await Delay(800, _ct);
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            var current = await PrivateServerWaitText(PrivateServerHandbookFilterRect, PrivateServerHandbookFilterNames, 3000, click: false);
+            if (current == null)
+            {
+                _logger.LogWarning("{Name}：没有找到讨伐页左上方的筛选下拉框", Name);
+                return false;
+            }
+
+            if (current.Contains("首领", StringComparison.Ordinal))
+            {
+                await Delay(500, _ct);
+                return true;
+            }
+
+            // 点开下拉框，选择“首领”
+            await PrivateServerWaitText(PrivateServerHandbookFilterRect, PrivateServerHandbookFilterNames, 1000, click: true);
+            await Delay(700, _ct);
+            if (await PrivateServerWaitText(PrivateServerHandbookFilterListRect, ["首领"], 2000, click: true) != null)
+            {
+                await Delay(1000, _ct);
+            }
+        }
+
+        _logger.LogWarning("{Name}：讨伐页的下拉框没能切换到“首领”", Name);
+        return false;
+    }
+
+    /// <summary>
+    /// 在区域内等待任意一个文字出现；click 为 true 时点击它。
+    /// </summary>
+    /// <returns>识别到的文字；超时返回 null。</returns>
+    private async Task<string?> PrivateServerWaitText(Rect rect1080, IReadOnlyList<string> texts, int timeoutMs, bool click)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (true)
+        {
+            _ct.ThrowIfCancellationRequested();
+            using (var capture = CaptureToRectArea())
+            {
+                var region = capture.FindMulti(RecognitionObject.Ocr(ScaleRect(rect1080)))
+                    .FirstOrDefault(r => texts.Any(t => r.Text.Contains(t, StringComparison.Ordinal)));
+                if (region != null)
+                {
+                    if (click)
+                    {
+                        region.Click();
+                    }
+
+                    return region.Text;
+                }
+            }
+
+            if (stopwatch.ElapsedMilliseconds >= timeoutMs)
+            {
+                return null;
+            }
+
+            await Delay(300, _ct);
+        }
+    }
+
+    /// <summary>
+    /// 识别冒险之证右页上方的首领名字。
+    /// </summary>
+    /// <param name="previous">切换前的名字；不为空时会等待名字变化，3 秒内没变化返回 null。</param>
+    private async Task<string?> PrivateServerReadHandbookTitle(string? previous)
+    {
+        string? last = null;
+        for (var i = 0; i < 10; i++)
+        {
+            _ct.ThrowIfCancellationRequested();
+            using (var capture = CaptureToRectArea())
+            {
+                var text = string.Concat(capture.FindMulti(RecognitionObject.Ocr(ScaleRect(PrivateServerHandbookTitleRect)))
+                    .OrderBy(r => r.X)
+                    .Select(r => r.Text)).Trim();
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    last = text;
+                    if (previous == null || PrivateServerNormalizeBossName(text) != PrivateServerNormalizeBossName(previous))
+                    {
+                        return text;
+                    }
+                }
+            }
+
+            await Delay(300, _ct);
+        }
+
+        return previous == null ? last : null;
+    }
+
+    private static string PrivateServerNormalizeBossName(string text)
+    {
+        return new string(text.Where(ch => !char.IsWhiteSpace(ch) && !PrivateServerNameIgnoredChars.Contains(ch)).ToArray());
+    }
+
+    /// <summary>
+    /// 把冒险之证里识别到的名字对应到 BetterGI 支持的首领名称。
+    /// 忽略空格和“·”等符号后完全一致才算匹配；名字较长（6 个字以上）时允许 OCR 认错 1 个字。
+    /// </summary>
+    private static string? PrivateServerMatchSupportedBoss(string ocrText)
+    {
+        var text = PrivateServerNormalizeBossName(ocrText);
+        if (text.Length < 2)
+        {
+            return null;
+        }
+
+        foreach (var boss in AutoBossData.SupportedBossNames)
+        {
+            if (PrivateServerNormalizeBossName(boss) == text)
+            {
+                return boss;
+            }
+        }
+
+        string? best = null;
+        var bestDistance = int.MaxValue;
+        var tie = false;
+        foreach (var boss in AutoBossData.SupportedBossNames)
+        {
+            var name = PrivateServerNormalizeBossName(boss);
+            if (name.Length < 6)
+            {
+                continue;
+            }
+
+            var distance = PrivateServerEditDistance(name, text);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = boss;
+                tie = false;
+            }
+            else if (distance == bestDistance)
+            {
+                tie = true;
+            }
+        }
+
+        return bestDistance <= 1 && !tie ? best : null;
+    }
+
+    private static int PrivateServerEditDistance(string a, string b)
+    {
+        var dp = new int[b.Length + 1];
+        for (var j = 0; j <= b.Length; j++)
+        {
+            dp[j] = j;
+        }
+
+        for (var i = 1; i <= a.Length; i++)
+        {
+            var prev = dp[0];
+            dp[0] = i;
+            for (var j = 1; j <= b.Length; j++)
+            {
+                var temp = dp[j];
+                dp[j] = Math.Min(Math.Min(dp[j] + 1, dp[j - 1] + 1), prev + (a[i - 1] == b[j - 1] ? 0 : 1));
+                prev = temp;
+            }
+        }
+
+        return dp[b.Length];
+    }
+
+    /// <summary>
+    /// 在首领列表里找到红框（当前选中的首领）：在三列图标的位置上逐行检查图标外圈的红色圆环。
+    /// </summary>
+    private PrivateServerGridCell? PrivateServerFindSelectedCell(ImageRegion capture)
+    {
+        var src = capture.SrcMat;
+        var roi = ScaleRect(380, PrivateServerGridTop - 5, 600, PrivateServerGridBottom - PrivateServerGridTop + 10) & new Rect(0, 0, src.Width, src.Height);
+        if (roi.Width <= 0 || roi.Height <= 0)
+        {
+            return null;
+        }
+
+        using var bgr = PrivateServerCropBgr(src, roi);
+        using var hsv = new Mat();
+        Cv2.CvtColor(bgr, hsv, ColorConversionCodes.BGR2HSV);
+        using var low = new Mat();
+        using var high = new Mat();
+        using var mask = new Mat();
+        Cv2.InRange(hsv, new Scalar(0, 60, 110), new Scalar(12, 255, 255), low);
+        Cv2.InRange(hsv, new Scalar(170, 60, 110), new Scalar(180, 255, 255), high);
+        Cv2.BitwiseOr(low, high, mask);
+
+        var best = new PrivateServerGridCell(-1, 0, 0);
+        for (var col = 0; col < PrivateServerGridColumnX.Length; col++)
+        {
+            for (var y = PrivateServerGridTop + 12; y <= PrivateServerGridBottom - 5; y += 3)
+            {
+                var score = PrivateServerRingScore(mask, roi, PrivateServerGridColumnX[col], y);
+                if (score > best.Score)
+                {
+                    best = new PrivateServerGridCell(col, y, score);
+                }
+            }
+        }
+
+        if (best.Col < 0)
+        {
+            return null;
+        }
+
+        var refined = best;
+        for (var dy = -3; dy <= 3; dy++)
+        {
+            var score = PrivateServerRingScore(mask, roi, PrivateServerGridColumnX[best.Col], best.Y + dy);
+            if (score > refined.Score)
+            {
+                refined = new PrivateServerGridCell(best.Col, best.Y + dy, score);
+            }
+        }
+
+        return refined.Score >= 0.3 ? refined : null;
+    }
+
+    /// <summary>
+    /// 计算以 (cx, cy)（1080P 坐标）为中心的圆环上红色像素的比例；跳过图标下方的等级标签和列表外的部分。
+    /// </summary>
+    private double PrivateServerRingScore(Mat mask, Rect roi, double cx, double cy)
+    {
+        var hit = 0;
+        var total = 0;
+        foreach (var radius in PrivateServerRingRadii)
+        {
+            for (var angle = 0; angle < 360; angle += 5)
+            {
+                var rad = angle * Math.PI / 180.0;
+                var x = cx + radius * Math.Cos(rad);
+                var y = cy + radius * Math.Sin(rad);
+                if (y > cy + 50 || y < PrivateServerGridTop || y > PrivateServerGridBottom)
+                {
+                    continue;
+                }
+
+                var px = (int)Math.Round(x * AssetScale) - roi.X;
+                var py = (int)Math.Round(y * AssetScale) - roi.Y;
+                if (px < 0 || py < 0 || px >= mask.Width || py >= mask.Height)
+                {
+                    continue;
+                }
+
+                total++;
+                if (mask.At<byte>(py, px) != 0)
+                {
+                    hit++;
+                }
+            }
+        }
+
+        return total >= 40 ? (double)hit / total : 0;
+    }
+
+    /// <summary>
+    /// 判断首领列表某个格子里有没有首领图标（空格子是纯色背景）。
+    /// </summary>
+    private bool PrivateServerCellHasIcon(ImageRegion capture, int col, double y)
+    {
+        var src = capture.SrcMat;
+        var cx = ScaleX(PrivateServerGridColumnX[col]);
+        var cy = (int)Math.Round(y * AssetScale);
+        var r = Math.Max(ScaleX(38), 10);
+        var rect = new Rect(cx - r, cy - r, 2 * r + 1, 2 * r + 1) & new Rect(0, 0, src.Width, src.Height);
+        if (rect.Width < r || rect.Height < r)
+        {
+            return false;
+        }
+
+        using var bgr = PrivateServerCropBgr(src, rect);
+        using var gray = new Mat();
+        Cv2.CvtColor(bgr, gray, ColorConversionCodes.BGR2GRAY);
+        using var circle = new Mat(gray.Size(), MatType.CV_8UC1, Scalar.Black);
+        Cv2.Circle(circle, new Point(cx - rect.X, cy - rect.Y), r, Scalar.White, -1);
+        Cv2.MeanStdDev(gray, out _, out var stddev, circle);
+        return stddev.Val0 >= 15;
+    }
+
+    /// <summary>
+    /// 在首领列表上滚动鼠标滚轮。
+    /// </summary>
+    /// <param name="clicks">滚动格数，负数向下滚动。</param>
+    /// <returns>列表内容垂直移动的距离（1080P 像素，负数表示内容向上移动）；无法判断时返回 null。</returns>
+    private async Task<double?> PrivateServerScrollGrid(int clicks)
+    {
+        var rect = ScaleRect(PrivateServerGridScrollRect);
+        using var before = PrivateServerGrabGray(rect);
+        GameCaptureRegion.GameRegion1080PPosMove(682, 560);
+        await Delay(150, _ct);
+        Simulation.SendInput.Mouse.VerticalScroll(clicks);
+        await Delay(900, _ct);
+        using var after = PrivateServerGrabGray(rect);
+        if (before == null || after == null || before.Size() != after.Size())
+        {
+            return null;
+        }
+
+        using var a = new Mat();
+        using var b = new Mat();
+        using var window = new Mat();
+        before.ConvertTo(a, MatType.CV_32FC1);
+        after.ConvertTo(b, MatType.CV_32FC1);
+        var shift = Cv2.PhaseCorrelate(a, b, window, out var response);
+        if (response < 0.15)
+        {
+            return null;
+        }
+
+        return shift.Y / AssetScale;
+    }
+
+    private Mat? PrivateServerGrabGray(Rect rect)
+    {
+        using var capture = CaptureToRectArea();
+        var src = capture.SrcMat;
+        var r = rect & new Rect(0, 0, src.Width, src.Height);
+        if (r.Width <= 0 || r.Height <= 0)
+        {
+            return null;
+        }
+
+        using var bgr = PrivateServerCropBgr(src, r);
+        var gray = new Mat();
+        Cv2.CvtColor(bgr, gray, ColorConversionCodes.BGR2GRAY);
+        return gray;
+    }
+
+    /// <summary>
+    /// 找到红框标记的首领在列表中的位置；当前画面没有时，先往下滚动找，再往上滚动找。
+    /// </summary>
+    private async Task<(int Col, double Y)?> PrivateServerLocateSelectedCell()
+    {
+        foreach (var clicks in new[] { -2, 2 })
+        {
+            for (var i = 0; i < 30; i++)
+            {
+                using (var capture = CaptureToRectArea())
+                {
+                    if (PrivateServerFindSelectedCell(capture) is { } cell)
+                    {
+                        return (cell.Col, cell.Y);
+                    }
+                }
+
+                var shift = await PrivateServerScrollGrid(clicks);
+                if (shift is { } moved && Math.Abs(moved) < 3)
+                {
+                    // 已经滚动到底（或到顶）了，再检查一次当前画面
+                    using var capture = CaptureToRectArea();
+                    if (PrivateServerFindSelectedCell(capture) is { } last)
+                    {
+                        return (last.Col, last.Y);
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 选中红框标记的下一个首领（同一行的右边一个；已经是最右边时换到下一行的第一个），需要时先滚动列表。
+    /// </summary>
+    /// <param name="page">当前视觉定位页面。</param>
+    /// <param name="col">当前红框所在的列（0～2）。</param>
+    /// <param name="y">当前红框图标中心的 Y 坐标（1080P）。</param>
+    private async Task<PrivateServerHandbookStep> PrivateServerSelectNextCell(BvPage page, int col, double y)
+    {
+        var targetCol = col < 2 ? col + 1 : 0;
+        var rowOffset = col < 2 ? 0 : PrivateServerGridRowPitch;
+        var targetY = y + rowOffset;
+
+        // 1. 下一个图标没有完整显示时，滚动列表
+        for (var i = 0; i < 25; i++)
+        {
+            if (targetY >= PrivateServerGridSafeTop && targetY <= PrivateServerGridSafeBottom)
+            {
+                break;
+            }
+
+            var down = targetY > PrivateServerGridSafeBottom;
+            var shift = await PrivateServerScrollGrid(down ? -1 : 1);
+            double? moved = null;
+            using (var capture = CaptureToRectArea())
+            {
+                // 红框还在画面里时，用红框的新位置判断滚动了多少（最准确）
+                if (PrivateServerFindSelectedCell(capture) is { } cell && cell.Col == col)
+                {
+                    moved = cell.Y - y;
+                }
+            }
+
+            moved ??= shift;
+            if (moved is null)
+            {
+                _logger.LogWarning("{Name}：无法判断首领列表滚动了多少", Name);
+                return new PrivateServerHandbookStep(PrivateServerHandbookStepResult.Failed, 0, 0);
+            }
+
+            if (Math.Abs(moved.Value) < 3)
+            {
+                // 列表已经滚不动了
+                if (down && targetY > PrivateServerGridBottom - 40)
+                {
+                    // 下面没有更多行了
+                    return new PrivateServerHandbookStep(PrivateServerHandbookStepResult.EndOfList, 0, 0);
+                }
+
+                if (!down && targetY < PrivateServerGridTop + 40)
+                {
+                    return new PrivateServerHandbookStep(PrivateServerHandbookStepResult.Failed, 0, 0);
+                }
+
+                // 下一个图标大部分可见，直接点击
+                break;
+            }
+
+            y += moved.Value;
+            targetY = y + rowOffset;
+        }
+
+        if (targetY < PrivateServerGridTop + 40 || targetY > PrivateServerGridBottom - 40)
+        {
+            _logger.LogWarning("{Name}：没能把下一个首领滚动到可见位置", Name);
+            return new PrivateServerHandbookStep(PrivateServerHandbookStepResult.Failed, 0, 0);
+        }
+
+        // 2. 下一个格子是空的，说明已经到列表末尾
+        using (var capture = CaptureToRectArea())
+        {
+            if (!PrivateServerCellHasIcon(capture, targetCol, targetY))
+            {
+                return new PrivateServerHandbookStep(PrivateServerHandbookStepResult.EndOfList, 0, 0);
+            }
+        }
+
+        // 3. 点击下一个首领的图标，确认红框移动过去了
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            page.Click(PrivateServerGridColumnX[targetCol], targetY);
+            await Delay(1000, _ct);
+            using var capture = CaptureToRectArea();
+            if (PrivateServerFindSelectedCell(capture) is { } cell && cell.Col == targetCol)
+            {
+                return new PrivateServerHandbookStep(PrivateServerHandbookStepResult.Selected, cell.Col, cell.Y);
+            }
+        }
+
+        return new PrivateServerHandbookStep(PrivateServerHandbookStepResult.Failed, 0, 0);
+    }
+
+    /// <summary>
+    /// 点击冒险之证右页的“前往”，在打开的大地图上点击“传送并追踪”，等待传送完成回到游戏主界面。
+    /// 大地图上显示的是“追踪并引导”时，说明附近没有解锁的传送锚点：不点击，返回 NoWaypoint。
+    /// </summary>
+    private async Task<PrivateServerTeleportResult> PrivateServerClickGotoAndTeleport(BvPage page)
+    {
+        if (await PrivateServerWaitText(PrivateServerHandbookGotoRect, ["前往"], 3000, click: true) == null)
+        {
+            _logger.LogWarning("{Name}：冒险之证右页没有找到“前往”", Name);
+            return PrivateServerTeleportResult.NoGotoButton;
+        }
+
+        await Delay(1200, _ct);
+        var mapButton = await PrivateServerWaitText(PrivateServerMapTeleportTrackRect, ["传送", "引导"], 6000, click: false);
+        if (mapButton == null)
+        {
+            _logger.LogWarning("{Name}：大地图上没有找到“传送并追踪”", Name);
+            return PrivateServerTeleportResult.Failed;
+        }
+
+        if (!mapButton.Contains("传送", StringComparison.Ordinal))
+        {
+            // “追踪并引导”：附近没有解锁的传送锚点，不点击
+            return PrivateServerTeleportResult.NoWaypoint;
+        }
+
+        if (await PrivateServerWaitText(PrivateServerMapTeleportTrackRect, ["传送"], 2000, click: true) == null)
+        {
+            _logger.LogWarning("{Name}：大地图上没有找到“传送并追踪”", Name);
+            return PrivateServerTeleportResult.Failed;
+        }
+
+        await Delay(2000, _ct);
+        var stopwatch = Stopwatch.StartNew();
+        var mainUiTimes = 0;
+        while (stopwatch.Elapsed < TimeSpan.FromSeconds(40))
+        {
+            _ct.ThrowIfCancellationRequested();
+            using (var capture = CaptureToRectArea())
+            {
+                if (Bv.IsInMainUi(capture) && !Bv.IsInBigMapUi(capture))
+                {
+                    if (++mainUiTimes >= 3)
+                    {
+                        return PrivateServerTeleportResult.Teleported;
+                    }
+                }
+                else
+                {
+                    mainUiTimes = 0;
+                }
+            }
+
+            await Delay(500, _ct);
+        }
+
+        return PrivateServerTeleportResult.Failed;
+    }
+
+    // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）结束 ====================
 
     /// <summary>
     /// 关闭领奖结果页面，等待回到主界面。
