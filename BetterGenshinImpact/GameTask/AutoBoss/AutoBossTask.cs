@@ -108,6 +108,9 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <summary>最近一次看到征讨之花（头顶图标或红色花纹）的时间（UTC Ticks）。</summary>
     private long _psRewardTargetSeenTicks;
 
+    /// <summary>最近一次看到“接触征讨之花”提示的时间（UTC Ticks）。看到后原地停下，按一次交互键等结果（第 8 版）。</summary>
+    private long _psRewardPromptSeenTicks;
+
     /// <summary>附近找不到征讨之花时，允许像原来一样边转视角边往前走。</summary>
     private volatile bool _psRewardBlindWalk;
 
@@ -1302,6 +1305,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         // 私服：头顶没有图标的征讨之花需要更长的寻找时间
         var navigationTimeout = TimeSpan.FromSeconds(PrivateServerFindFlowerWithoutIcon ? 45 : 20);
         Interlocked.Exchange(ref _psRewardTargetSeenTicks, 0);
+        Interlocked.Exchange(ref _psRewardPromptSeenTicks, 0);
         _psRewardBlindWalk = !PrivateServerFindFlowerWithoutIcon;
         var adjustCameraTask = AdjustRewardCameraTask(page, navigationCts);
         var moveToRewardTask = MoveToRewardTask(page, navigationCts);
@@ -1376,12 +1380,15 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     {
         var ct = navigationCts.Token;
         var lastInteractAt = DateTime.MinValue;
+        // 私服：按了交互键却没有弹出领奖界面（也没认出提示文字）的次数
+        var unansweredPresses = 0;
 
         while (!ct.IsCancellationRequested)
         {
             ct.ThrowIfCancellationRequested();
 
-            if (HasRewardPanelPrompt(page))
+            // 私服：同时用稍宽的区域确认领奖界面
+            if (HasRewardPanelPrompt(page) || IsRewardPanelOpen(page))
             {
                 return;
             }
@@ -1395,14 +1402,33 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
             if (HasRewardInteractionPrompt(page))
             {
-                if (DateTime.UtcNow - lastInteractAt >= TimeSpan.FromMilliseconds(300))
+                // 私服：看到提示后原地停下（MoveToRewardTask 暂停往前走），按一次交互键后等一会儿看结果，不连续按。
+                // 本周次数用完时不会弹出领奖界面：原来每 0.3 秒按一次、边走边跳，角色会走过头，提示文字也会反复重新弹出而认不出来
+                Interlocked.Exchange(ref _psRewardPromptSeenTicks, DateTime.UtcNow.Ticks);
+                if (DateTime.UtcNow - lastInteractAt >= TimeSpan.FromMilliseconds(PrivateServerInteractRetryMs))
                 {
+                    if (lastInteractAt != DateTime.MinValue)
+                    {
+                        unansweredPresses++;
+                        if (unansweredPresses >= PrivateServerUnansweredInteractLimit)
+                        {
+                            // 私服：私服上按交互键打不开领奖界面，只会是本周次数用完了（提示文字没认出来时的兜底）
+                            _logger.LogWarning("{Name}：按了 {Count} 次交互键都没有弹出领奖界面（也没认出提示文字），按“本周收取该宝藏次数已耗尽”处理",
+                                Name, unansweredPresses);
+                            _psWeeklyLimitReached = true;
+                            return;
+                        }
+
+                        _logger.LogInformation("{Name}：按交互键后没有弹出领奖界面，再按一次", Name);
+                    }
+
                     Simulation.SendInput.SimulateAction(GIActions.PickUpOrInteract);
                     lastInteractAt = DateTime.UtcNow;
                 }
             }
 
-            await Delay(300, ct);
+            // 私服：刚按过交互键时看得勤一些（0.15 秒一次），平时和原来一样 0.3 秒一次
+            await Delay(DateTime.UtcNow - lastInteractAt < TimeSpan.FromSeconds(4) ? 150 : 300, ct);
         }
     }
 
@@ -1485,6 +1511,19 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                     Simulation.SendInput.SimulateAction(GIActions.MoveLeft, KeyType.KeyDown);
                     await Delay(800, ct);
                     Simulation.SendInput.SimulateAction(GIActions.MoveLeft, KeyType.KeyUp);
+                    continue;
+                }
+
+                // 私服：已经看到“接触征讨之花”提示时原地停下，等交互结果（本周次数用完时不会弹出领奖界面，继续往前走、跳会走过头）
+                if (DateTime.UtcNow.Ticks - Interlocked.Read(ref _psRewardPromptSeenTicks) < TimeSpan.FromSeconds(3).Ticks)
+                {
+                    if (isMovingForward)
+                    {
+                        Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+                        isMovingForward = false;
+                    }
+
+                    await Delay(200, ct);
                     continue;
                 }
 
@@ -2381,8 +2420,20 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
     // ---------- 界面坐标（1080P 基准，按用户截图测量） ----------
 
-    /// <summary>“本周收取该宝藏次数已耗尽”提示的识别区域（画面上方中间）。</summary>
-    private static readonly Rect PrivateServerWeeklyLimitToastRect = new(610, 175, 700, 80);
+    /// <summary>
+    /// “本周收取该宝藏次数已耗尽”提示的识别区域（画面上方中间，1080P）。
+    /// 这个提示是没有底框的白字，位置可能上下浮动，所以范围放宽（第 8 版：原来是 610, 175, 700, 80）。
+    /// </summary>
+    private static readonly Rect PrivateServerWeeklyLimitToastRect = new(480, 110, 960, 220);
+
+    /// <summary>提示文字里的关键词，认出任意一个就算（文字识别有时只能认出一部分）。</summary>
+    private static readonly string[] PrivateServerWeeklyLimitKeywords = ["耗尽", "收取该宝藏", "宝藏次数", "次数已耗"];
+
+    /// <summary>在征讨之花前按交互键后，等多久还没有领奖界面才再按一次（毫秒）。</summary>
+    private const int PrivateServerInteractRetryMs = 2500;
+
+    /// <summary>按了几次交互键都没有弹出领奖界面（也没认出提示文字）时，按“本周次数已用完”处理。</summary>
+    private const int PrivateServerUnansweredInteractLimit = 3;
 
     /// <summary>冒险之证最左侧一栏（见闻/委托/秘境/讨伐/向导/备战）的识别区域。</summary>
     private static readonly Rect PrivateServerHandbookTabRect = new(200, 190, 200, 600);
@@ -2546,7 +2597,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     private bool HasWeeklyLimitToast(BvPage page)
     {
         return page.Ocr(ScaleRect(PrivateServerWeeklyLimitToastRect))
-            .Any(region => region.Text.Contains("已耗尽", StringComparison.Ordinal));
+            .Any(region => PrivateServerIsWeeklyLimitText(region.Text));
     }
 
     /// <summary>
@@ -2554,7 +2605,14 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// </summary>
     private bool HasWeeklyLimitToast(ImageRegion capture)
     {
-        return FindOcrText(capture, ScaleRect(PrivateServerWeeklyLimitToastRect), "已耗尽") != null;
+        return capture.FindMulti(RecognitionObject.Ocr(ScaleRect(PrivateServerWeeklyLimitToastRect)))
+            .Any(region => PrivateServerIsWeeklyLimitText(region.Text));
+    }
+
+    /// <summary>识别到的文字是不是“本周收取该宝藏次数已耗尽”（含任意一个关键词）。</summary>
+    private static bool PrivateServerIsWeeklyLimitText(string text)
+    {
+        return PrivateServerWeeklyLimitKeywords.Any(keyword => text.Contains(keyword, StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -3147,20 +3205,42 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         }
 
         var tabClicked = false;
-        for (var attempt = 0; attempt < 2 && !tabClicked; attempt++)
+        for (var attempt = 0; attempt < 3 && !tabClicked; attempt++)
         {
-            Simulation.SendInput.SimulateAction(GIActions.OpenAdventurerHandbook);
-            await Delay(1000, _ct);
-            tabClicked = await PrivateServerWaitText(PrivateServerHandbookTabRect, ["讨伐"], 4000, click: true) != null;
-            if (!tabClicked && attempt == 0 && !await EnsureCleanMainUi(page, "重新打开冒险之证前"))
+            if (attempt == 1)
             {
-                return false;
+                // 私服：第二次直接按 F1（防止 BetterGI 的按键设置和游戏里不一样）
+                page.Keyboard.KeyPress(User32.VK.VK_F1);
+            }
+            else
+            {
+                Simulation.SendInput.SimulateAction(GIActions.OpenAdventurerHandbook);
+            }
+
+            await Delay(1000, _ct);
+            tabClicked = await PrivateServerWaitText(PrivateServerHandbookTabRect, ["讨伐"], 5000, click: true) != null;
+            if (!tabClicked)
+            {
+                _logger.LogInformation("{Name}：第 {Attempt} 次打开冒险之证后没有找到“讨伐”", Name, attempt + 1);
+                if (attempt < 2 && !await EnsureCleanMainUi(page, "重新打开冒险之证前"))
+                {
+                    return false;
+                }
             }
         }
 
         if (!tabClicked)
         {
-            _logger.LogWarning("{Name}：没有找到冒险之证最左侧的“讨伐”", Name);
+            // 私服：记录画面左侧认出的文字，方便排查
+            string seen;
+            using (var capture = CaptureToRectArea())
+            {
+                seen = string.Join("、", capture.FindMulti(RecognitionObject.Ocr(ScaleRect(PrivateServerHandbookTabRect)))
+                    .Select(region => region.Text).Take(8));
+            }
+
+            _logger.LogWarning("{Name}：没有找到冒险之证最左侧的“讨伐”（画面左侧认出的文字：{Texts}）", Name,
+                string.IsNullOrEmpty(seen) ? "无" : seen);
             return false;
         }
 
