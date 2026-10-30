@@ -151,6 +151,27 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     private bool _psSkipListLogged;
     // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）开关结束 ====================
 
+    // ==================== 私服自动领取空月祝福（自定义修改）开关 ====================
+    /// <summary>
+    /// 每天凌晨 4 点弹出“空月祝福”领取界面时，是否自动领取：暂停战斗、寻路等操作 → 点击空白处领取 →
+    /// 等动画结束 → 点击“点击空白区域继续”关闭“获得 原石”界面（不会点中间的原石）→ 继续之前的操作。
+    /// 改成 false 就不处理（BetterGI 自带的处理仍然有效，但它只在传送、走路线的时候检查）。
+    /// </summary>
+    private static readonly bool PrivateServerAutoClaimWelkinMoon = true;
+
+    /// <summary>同一时间只处理一次空月祝福。</summary>
+    private readonly SemaphoreSlim _psWelkinLock = new(1, 1);
+
+    /// <summary>最近一次处理空月祝福的时间（UTC Ticks，0 表示还没处理过）。</summary>
+    private long _psWelkinHandledTicks;
+
+    /// <summary>正在进行领奖、补充树脂、冒险之证这些自己的界面操作的层数（大于 0 时不把原石图标当作空月祝福）。</summary>
+    private int _psOwnUiDepth;
+
+    /// <summary>最近一次打开冒险之证选择首领是否因为操作失败而结束（用于被空月祝福打断后重试）。</summary>
+    private bool _psHandbookFailed;
+    // ==================== 私服自动领取空月祝福（自定义修改）开关结束 ====================
+
     private string PathingAssetFolder => Global.Absolute(@"GameTask\AutoBoss\Assets\Pathing");
 
     private double AssetScale => TaskContext.Instance().SystemInfo.AssetScale;
@@ -206,6 +227,11 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         LogScreenResolution();
 
         Notify.Event("AutoBoss").Success($"{Name}启动");
+        // 私服：后台检查每天凌晨 4 点弹出的空月祝福界面，出现时自动领取
+        using var psWelkinCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var psWelkinWatchdog = PrivateServerAutoClaimWelkinMoon
+            ? Task.Run(() => PrivateServerWelkinMoonWatchdog(psWelkinCts.Token))
+            : Task.CompletedTask;
         try
         {
             var retryCount = 0;
@@ -231,6 +257,17 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         }
         finally
         {
+            // 私服：停止后台检查空月祝福
+            psWelkinCts.Cancel();
+            try
+            {
+                await psWelkinWatchdog;
+            }
+            catch (Exception e)
+            {
+                _logger.LogDebug(e, "{Name}：停止空月祝福检查时出错", Name);
+            }
+
             Simulation.ReleaseAllKey();
             Simulation.SendInput.Mouse.LeftButtonUp();
             Notify.Event("AutoBoss").Success($"{Name}结束");
@@ -293,7 +330,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             }
             
             //7.交互征讨之花
-            var rewardSuccess = await TakeReward();
+            bool rewardSuccess;
+            // 私服：领奖（包括补充树脂）是自己的界面操作，这期间后台检查不把原石图标当作空月祝福的“获得”界面
+            using (PrivateServerEnterOwnUi())
+            {
+                rewardSuccess = await TakeReward();
+            }
+
             // 私服：征讨之花提示“本周收取该宝藏次数已耗尽” → 按冒险之证的顺序换下一个首领
             if (_psWeeklyLimitReached)
             {
@@ -2154,6 +2197,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         for (var i = 0; i < 15; i++)
         {
             _ct.ThrowIfCancellationRequested();
+            // 私服：每天凌晨 4 点弹出的空月祝福界面，先领取（不然会被当成未知界面按 ESC）
+            if (await PrivateServerTryClaimWelkinMoonNow())
+            {
+                unknownTimes = 0;
+                continue;
+            }
+
             using (var capture = CaptureToRectArea())
             {
                 var inMainUi = Bv.IsInMainUi(capture);
@@ -2771,9 +2821,29 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     {
         var skipList = PrivateServerLoadSkippedBosses();
         var reopened = false;
+        string? cappedBoss = null;
+        var welkinRetries = 0;
         for (var attempt = 0; attempt < 40; attempt++)
         {
-            var (reopen, boss) = await PrivateServerSelectBossInHandbookOnce(advance, reopened, skipList);
+            var welkinTicks = Interlocked.Read(ref _psWelkinHandledTicks);
+            _psHandbookFailed = false;
+            var (reopen, boss) = await PrivateServerSelectBossInHandbookOnce(advance, reopened, skipList, cappedBoss);
+            if (!reopen && boss == null && _psHandbookFailed && welkinRetries < 2
+                && Interlocked.Read(ref _psWelkinHandledTicks) != welkinTicks)
+            {
+                // 私服：冒险之证操作被空月祝福界面打断（已经自动领取），重新打开冒险之证，从红框标记的首领继续
+                welkinRetries++;
+                _logger.LogInformation("{Name}：冒险之证操作被空月祝福界面打断，重新打开冒险之证继续", Name);
+                if (advance && !reopened)
+                {
+                    // 本周已讨伐完毕的首领：重新打开时如果红框还停在它上面，就从它的下一个开始找
+                    cappedBoss = _taskParam.BossName;
+                }
+
+                advance = false;
+                continue;
+            }
+
             if (!reopen)
             {
                 return boss;
@@ -2793,14 +2863,19 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// </summary>
     /// <returns>Reopen 为 true：刚才的首领附近没有解锁的传送锚点，需要重新打开冒险之证继续找；
     /// 否则 Boss 为选中的首领（null 表示列表已经到末尾或操作失败）。</returns>
-    private async Task<(bool Reopen, string? Boss)> PrivateServerSelectBossInHandbookOnce(bool advance, bool reopened, IReadOnlyList<string> skipList)
+    /// <param name="cappedBoss">被空月祝福打断后重新打开时，本周已讨伐完毕的首领：红框还停在它上面时从它的下一个开始找。</param>
+    private async Task<(bool Reopen, string? Boss)> PrivateServerSelectBossInHandbookOnce(bool advance, bool reopened, IReadOnlyList<string> skipList,
+        string? cappedBoss = null)
     {
+        // 私服：冒险之证是自己的界面操作，这期间后台检查不把原石图标当作空月祝福的“获得”界面
+        using var psOwnUi = PrivateServerEnterOwnUi();
         var page = new BvPage(_ct);
         try
         {
             if (!await PrivateServerOpenHandbookBossList(page))
             {
                 _logger.LogWarning("{Name}：打开冒险之证首领列表失败", Name);
+                _psHandbookFailed = true;
                 return (false, null);
             }
 
@@ -2809,15 +2884,24 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
             if (!advance)
             {
-                var first = await PrivateServerEvaluateHandbookCandidate(page, title, skipList, isNext: false);
-                if (first.Result == PrivateServerCandidateResult.Selected)
+                var redBoss = title == null ? null : PrivateServerMatchSupportedBoss(title);
+                if (cappedBoss != null && redBoss == cappedBoss)
                 {
-                    return (false, first.Boss);
+                    // 被空月祝福打断后重新打开：红框还停在本周已讨伐完毕的首领上，从它的下一个开始找
+                    _logger.LogInformation("{Name}：红框还停在本周已讨伐完毕的 {Boss} 上，从它的下一个开始找", Name, cappedBoss);
                 }
-
-                if (first.Result == PrivateServerCandidateResult.SkipAndReopen)
+                else
                 {
-                    return (true, null);
+                    var first = await PrivateServerEvaluateHandbookCandidate(page, title, skipList, isNext: false);
+                    if (first.Result == PrivateServerCandidateResult.Selected)
+                    {
+                        return (false, first.Boss);
+                    }
+
+                    if (first.Result == PrivateServerCandidateResult.SkipAndReopen)
+                    {
+                        return (true, null);
+                    }
                 }
             }
             else if (!reopened)
@@ -2833,6 +2917,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             if (selected == null)
             {
                 _logger.LogWarning("{Name}：冒险之证首领列表里找不到红框标记的首领", Name);
+                _psHandbookFailed = true;
                 return (false, null);
             }
 
@@ -2858,6 +2943,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 if (step.Result == PrivateServerHandbookStepResult.Failed)
                 {
                     _logger.LogWarning("{Name}：在冒险之证里选择下一个首领失败", Name);
+                    _psHandbookFailed = true;
                     return (false, null);
                 }
 
@@ -2885,6 +2971,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         catch (Exception e) when (e is not (OperationCanceledException or NormalEndException or RetryException))
         {
             _logger.LogWarning("{Name}：冒险之证操作出错：{Message}", Name, e.Message);
+            _psHandbookFailed = true;
             return (false, null);
         }
         finally
@@ -3595,6 +3682,305 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     }
 
     // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）结束 ====================
+
+    // ==================== 私服自动领取空月祝福（自定义修改）开始 ====================
+
+    /// <summary>空月祝福界面的识别结果。</summary>
+    private enum PrivateServerWelkinScreen
+    {
+        /// <summary>不是空月祝福界面。</summary>
+        None,
+
+        /// <summary>“点击领取今日空月祝福奖励”界面。</summary>
+        Claim,
+
+        /// <summary>领取后的“获得 原石”界面（或者被战斗时的点击打开的原石详情）。</summary>
+        Obtain,
+    }
+
+    /// <summary>空月祝福界面下方“点击领取今日空月祝福奖励”文字的识别范围（1080P 坐标，会按游戏分辨率缩放）。</summary>
+    private Rect PrivateServerWelkinTextRect => ScaleRect(560, 800, 800, 140);
+
+    /// <summary>领取时点击的空白位置（1080P 坐标）：左上角，避开画面中间的原石图标。</summary>
+    private const int PrivateServerWelkinBlankX = 100;
+
+    /// <summary>领取时点击的空白位置（1080P 坐标）。</summary>
+    private const int PrivateServerWelkinBlankY = 100;
+
+    /// <summary>“获得 原石”界面看不到提示文字时，最多点击几次空白处（防止误识别时一直乱点）。</summary>
+    private const int PrivateServerWelkinMaxObtainBlankClicks = 5;
+
+    /// <summary>
+    /// 后台检查空月祝福界面：任务运行期间每秒检查一次，发现后暂停战斗、寻路等操作并自动领取，领取完继续。
+    /// 空月祝福在游戏服务器时间每天凌晨 4 点弹出，私服的时间可能和官服不一样，所以这里不限制时间段。
+    /// </summary>
+    /// <param name="ct">任务结束时取消。</param>
+    private async Task PrivateServerWelkinMoonWatchdog(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(1000, ct);
+                if (RunnerContext.Instance.IsSuspend)
+                {
+                    // 手动暂停中（或者正在处理），不打扰
+                    continue;
+                }
+
+                PrivateServerWelkinScreen screen;
+                using (var capture = CaptureToRectArea())
+                {
+                    screen = PrivateServerDetectWelkinMoon(capture, allowObtain: Volatile.Read(ref _psOwnUiDepth) == 0);
+                }
+
+                if (screen != PrivateServerWelkinScreen.None)
+                {
+                    await PrivateServerClaimWelkinMoon(
+                        screen == PrivateServerWelkinScreen.Claim ? "检测到空月祝福界面" : "检测到空月祝福的“获得 原石”界面", ct);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception e)
+            {
+                _logger.LogDebug(e, "{Name}：检查空月祝福界面时出错", Name);
+                try
+                {
+                    await Task.Delay(3000, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 判断当前画面是不是空月祝福界面。
+    /// </summary>
+    /// <param name="capture">游戏截图。</param>
+    /// <param name="allowObtain">是否把“获得 原石”界面也算进去。自己操作领奖、补充树脂、冒险之证时不算：补充树脂的界面里也有原石图标。</param>
+    private PrivateServerWelkinScreen PrivateServerDetectWelkinMoon(ImageRegion capture, bool allowObtain)
+    {
+        // 能看到左上角的派蒙图标 = 在游戏主界面（领奖、补充树脂的界面后面也能看到派蒙），不是空月祝福
+        if (PrivateServerPaimonVisible(capture))
+        {
+            return PrivateServerWelkinScreen.None;
+        }
+
+        // BetterGI 自带的空月祝福图标识别，或者下方的“点击领取今日空月祝福奖励”文字
+        if (Bv.IsInBlessingOfTheWelkinMoon(capture)
+            || FindOcrText(capture, PrivateServerWelkinTextRect, "空月祝福") != null)
+        {
+            return PrivateServerWelkinScreen.Claim;
+        }
+
+        if (allowObtain && PrivateServerPrimogemVisible(capture))
+        {
+            return PrivateServerWelkinScreen.Obtain;
+        }
+
+        return PrivateServerWelkinScreen.None;
+    }
+
+    /// <summary>左上角的派蒙图标是否可见（只看图标，比 Bv.IsInMainUi 快，适合后台频繁检查）。</summary>
+    private static bool PrivateServerPaimonVisible(ImageRegion capture)
+    {
+        using var paimon = capture.Find(BetterGenshinImpact.GameTask.Common.Element.Assets.ElementRecognition.Get("PaimonMenu", capture));
+        return paimon.IsExist();
+    }
+
+    /// <summary>画面中间三分之一的高度范围内是否有原石图标（BetterGI 自带的原石图片）。</summary>
+    private static bool PrivateServerPrimogemVisible(ImageRegion capture)
+    {
+        using var primogem = capture.Find(BetterGenshinImpact.GameTask.Common.Element.Assets.ElementRecognition.Get("Primogem", capture));
+        return primogem.IsExist();
+    }
+
+    /// <summary>
+    /// 在“回到游戏主界面”等自己的检查里顺便处理空月祝福：画面是空月祝福界面时领取并返回 true。
+    /// </summary>
+    private async Task<bool> PrivateServerTryClaimWelkinMoonNow()
+    {
+        if (!PrivateServerAutoClaimWelkinMoon)
+        {
+            return false;
+        }
+
+        bool found;
+        using (var capture = CaptureToRectArea())
+        {
+            found = PrivateServerDetectWelkinMoon(capture, allowObtain: false) == PrivateServerWelkinScreen.Claim;
+        }
+
+        if (!found)
+        {
+            return false;
+        }
+
+        await PrivateServerClaimWelkinMoon("检测到空月祝福界面", _ct);
+        return true;
+    }
+
+    /// <summary>
+    /// 领取空月祝福：暂停战斗、寻路等操作 → 点击左上角空白处领取 → 等两三秒的动画 →
+    /// 点击“点击空白区域继续”这行字关闭“获得 原石”界面（不会点中间的原石）→ 恢复之前的操作。
+    /// 注意：这里只能用 Task.Delay 等待，不能用 Delay / Sleep（暂停期间它们会一直等下去，造成卡死）。
+    /// </summary>
+    /// <param name="reason">日志里显示的原因。</param>
+    /// <param name="ct">取消令牌。</param>
+    private async Task PrivateServerClaimWelkinMoon(string reason, CancellationToken ct)
+    {
+        await _psWelkinLock.WaitAsync(ct);
+        var runner = RunnerContext.Instance;
+        var suspendedHere = false;
+        var acted = false;
+        try
+        {
+            if (!runner.IsSuspend)
+            {
+                // 暂停任务：正在进行的战斗、寻路会在下一次等待时停下来（BetterGI 日志会显示“快捷键触发暂停，等待解除”）
+                runner.IsSuspend = true;
+                suspendedHere = true;
+            }
+
+            // 等正在进行的按键、点击停下来
+            await Task.Delay(800, ct);
+
+            var stopwatch = Stopwatch.StartNew();
+            var clearTimes = 0;
+            var claimClicked = false;
+            var obtainSeen = false;
+            var obtainBlankClicks = 0;
+            var lastClaimClick = TimeSpan.Zero;
+            while (stopwatch.Elapsed < TimeSpan.FromSeconds(40))
+            {
+                ct.ThrowIfCancellationRequested();
+                var clickBlank = false;
+                var clickedHint = false;
+                using (var capture = CaptureToRectArea())
+                {
+                    if (PrivateServerDetectWelkinMoon(capture, allowObtain: false) == PrivateServerWelkinScreen.Claim)
+                    {
+                        // “点击领取今日空月祝福奖励”：点击左上角空白处领取
+                        clickBlank = true;
+                        claimClicked = true;
+                        lastClaimClick = stopwatch.Elapsed;
+                    }
+                    else
+                    {
+                        var hint = FindOcrText(capture, PrivateServerObtainHintRect, "空白区域");
+                        if (hint != null)
+                        {
+                            // “获得 原石”界面：点击“点击空白区域继续”这行字关闭，不点中间的原石
+                            hint.Click();
+                            clickedHint = true;
+                            obtainSeen = true;
+                        }
+                        else if (obtainBlankClicks < PrivateServerWelkinMaxObtainBlankClicks
+                                 && !PrivateServerPaimonVisible(capture)
+                                 && (PrivateServerPrimogemVisible(capture)
+                                     || FindOcrText(capture, PrivateServerObtainTitleRect, "获得") != null))
+                        {
+                            // 看不到提示文字，但还在“获得 原石”界面（或者原石详情）：点击左上角空白处关闭
+                            clickBlank = true;
+                            obtainSeen = true;
+                            obtainBlankClicks++;
+                        }
+                    }
+                }
+
+                if (clickBlank || clickedHint)
+                {
+                    if (!acted)
+                    {
+                        acted = true;
+                        _logger.LogInformation("{Name}：{Reason}，暂停当前操作，自动领取", Name, reason);
+                    }
+
+                    if (clickBlank)
+                    {
+                        GameCaptureRegion.GameRegion1080PPosClick(PrivateServerWelkinBlankX, PrivateServerWelkinBlankY);
+                    }
+
+                    clearTimes = 0;
+                    await Task.Delay(clickedHint ? 1000 : 800, ct);
+                    continue;
+                }
+
+                // 点击领取后有两三秒的动画，动画结束才出现“获得”界面，这段时间不算已经关闭
+                if (claimClicked && !obtainSeen && stopwatch.Elapsed - lastClaimClick < TimeSpan.FromSeconds(8))
+                {
+                    await Task.Delay(500, ct);
+                    continue;
+                }
+
+                if (++clearTimes >= 3)
+                {
+                    break;
+                }
+
+                await Task.Delay(500, ct);
+            }
+
+            if (!acted)
+            {
+                _logger.LogDebug("{Name}：{Reason}，但再次检查时界面已经关闭", Name, reason);
+            }
+            else if (clearTimes >= 3)
+            {
+                _logger.LogInformation("{Name}：空月祝福已领取，继续之前的操作", Name);
+            }
+            else
+            {
+                _logger.LogWarning("{Name}：空月祝福界面 40 秒内没能关闭，先继续之前的操作", Name);
+            }
+        }
+        finally
+        {
+            if (suspendedHere)
+            {
+                runner.IsSuspend = false;
+            }
+
+            if (acted)
+            {
+                Interlocked.Exchange(ref _psWelkinHandledTicks, DateTime.UtcNow.Ticks);
+            }
+
+            _psWelkinLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// 进入自己的界面操作（领奖、补充树脂、冒险之证）：这期间后台检查不把原石图标当作空月祝福的“获得”界面
+    /// （补充树脂的界面里也有原石选项）。用 using 包起来，结束时自动退出。
+    /// </summary>
+    private IDisposable PrivateServerEnterOwnUi()
+    {
+        Interlocked.Increment(ref _psOwnUiDepth);
+        return new PrivateServerOwnUiScope(this);
+    }
+
+    /// <summary><see cref="PrivateServerEnterOwnUi"/> 的退出器。</summary>
+    private sealed class PrivateServerOwnUiScope(AutoBossTask owner) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                Interlocked.Decrement(ref owner._psOwnUiDepth);
+            }
+        }
+    }
+
+    // ==================== 私服自动领取空月祝福（自定义修改）结束 ====================
 
     /// <summary>
     /// 关闭领奖结果页面，等待回到主界面。
