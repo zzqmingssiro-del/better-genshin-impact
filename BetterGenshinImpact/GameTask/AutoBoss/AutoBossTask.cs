@@ -87,6 +87,8 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     // 另外，有些首领的征讨之花头顶没有图标，原来的找花方法找不到就会结束任务；现在找不到图标时改为按花身上的红色花纹寻找。
     // 第 9 版：战斗结束后先原地慢慢转视角找花（转的时候不走动），找到后对准直线走过去；转完几圈还找不到，
     // 就传送到首领附近的传送锚点、按 BetterGI 自带的路线重新跑到首领那里再找一次，还找不到就换下一个首领。
+    // 第 10 版：找花前先把镜头拉远（滚轮往下）、视角朝下看，让画面里主要是地面；头顶没有图标的花改按深色叶子和红紫色花苞找，
+    // 减少光影和地形颜色的干扰；走到花跟前（或者没找到）时把视角回正。
     // 下面几个开关改完需要重新编译。
 
     /// <summary>征讨之花提示“本周收取该宝藏次数已耗尽”时，是否按冒险之证首领列表顺序自动换下一个首领继续讨伐（关闭时直接结束任务）。</summary>
@@ -98,7 +100,10 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <summary>在冒险之证选好首领后，是否点击“前往”→“传送并追踪”（追踪该首领），之后再走 BetterGI 自带的路线。</summary>
     private static readonly bool PrivateServerHandbookTeleportAndTrack = true;
 
-    /// <summary>征讨之花头顶没有图标时，是否改为按征讨之花身上的红色花纹寻找（还找不到时回到首领位置再找一次）。</summary>
+    /// <summary>
+    /// 征讨之花头顶没有图标时，是否改为按花本身的样子寻找：第 5～8 版的找法按花身上的红色花纹找（还找不到时回到首领位置再找一次）；
+    /// 第 9 版的找法（PrivateServerSlowScanForFlower）里，第 10 版起改为按深色叶子和红紫色花苞找。
+    /// </summary>
     private static readonly bool PrivateServerFindFlowerWithoutIcon = true;
 
     /// <summary>
@@ -110,6 +115,18 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
     /// <summary>本轮原地转了几圈、重新跑图后都没有找到征讨之花（第 9 版）。</summary>
     private volatile bool _psFlowerNotFound;
+
+    /// <summary>
+    /// 找征讨之花前，是否先把镜头拉远（滚轮往下滚）、视角朝下看，让画面里主要是地面：远处的地形、天空、光影干扰少了，角色也不容易挡住花。
+    /// 走到花跟前（或者没找到）时按一下鼠标中键把视角回正；镜头拉远后不会再拉近。只在 PrivateServerSlowScanForFlower 为 true 时有效。（第 10 版）
+    /// </summary>
+    private static readonly bool PrivateServerZoomOutAndLookDown = true;
+
+    /// <summary>没找到征讨之花时，是否把找花时看到的画面保存到 BetterGI 文件夹里的 log\pserver_flower（每次最多 8 张），方便以后调整识别。（第 10 版）</summary>
+    private static readonly bool PrivateServerSaveFlowerSearchScreenshots = true;
+
+    /// <summary>找花时视角朝下看过、还没来得及回正（例如直接进了领奖界面），下一轮开打前要先回正（第 10 版）。</summary>
+    private volatile bool _psCameraNeedsReset;
 
     /// <summary>本轮在征讨之花处看到了“本周收取该宝藏次数已耗尽”。</summary>
     private volatile bool _psWeeklyLimitReached;
@@ -237,6 +254,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         _successfulRewardCount = 0;
         _psWeeklyLimitReached = false;
         _psFlowerNotFound = false;
+        _psCameraNeedsReset = false;
         _psStartSelectionDone = false;
         _psSkipListLogged = false;
         Validate();
@@ -321,6 +339,15 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 break;
             }
             
+            // 私服：找花时视角朝下看过、还没回正的（例如直接进了领奖界面），开打前先回正（第 10 版）
+            if (_psCameraNeedsReset)
+            {
+                _psCameraNeedsReset = false;
+                Simulation.SendInput.Mouse.MiddleButtonClick();
+                _logger.LogInformation("{Name}：视角回正", Name);
+                await Delay(300, _ct);
+            }
+
             //4.首次讨伐 or 回过七天神像 则需要重新寻路到首领
             if (shouldNavigateToBoss)
             {
@@ -402,6 +429,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 await RepositionAfterFight();
                 shouldNavigateToBoss = false;
             }
+        }
+
+        // 私服：找花时视角朝下看过、还没回正的，任务结束前回正（第 10 版）
+        if (_psCameraNeedsReset)
+        {
+            _psCameraNeedsReset = false;
+            Simulation.SendInput.Mouse.MiddleButtonClick();
         }
     }
 
@@ -3818,6 +3852,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     }
 
     // ---------- 第 9 版：战斗结束后原地慢慢转视角找征讨之花，找到后对准直线走过去 ----------
+    // ---------- 第 10 版：找花前先把镜头拉远、视角朝下看；头顶没有图标的花改按“深色叶子 + 红紫色花苞”找 ----------
 
     /// <summary>原地转视角找花时最多转几圈（第 9 版）。</summary>
     private const int PrivateServerFlowerScanRounds = 3;
@@ -3846,6 +3881,60 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <summary>头顶图标在画面这个高度（比例）以下时，说明花在身后，不算找到，继续转（第 9 版）。</summary>
     private const double PrivateServerFlowerIconFrontMaxRatio = 0.7;
 
+    /// <summary>找花前滚轮往下滚几格，把镜头拉远（第 10 版）。</summary>
+    private const int PrivateServerZoomOutScrollClicks = 10;
+
+    /// <summary>
+    /// 视角回正后再往下看多少度（第 10 版）。数字越大，画面里地面越多、干扰越少，但看到的范围越近，
+    /// 太大时离得稍远的花会看不到（往下看到底时只能看到身边 5 米左右）。
+    /// </summary>
+    private const double PrivateServerLookDownDegrees = 25;
+
+    /// <summary>一次找花最多朝几个目标走过去；都没有走到花跟前，就当作这次没找到，免得被认错的东西带着到处走（第 10 版）。</summary>
+    private const int PrivateServerMaxApproachAttempts = 4;
+
+    /// <summary>按叶子和花苞找到的花，中心在画面这个高度（1080P 的 Y 坐标）以下时，说明在角色身边或身后，不算找到，继续转（第 10 版）。</summary>
+    private const int PrivateServerLeafBudFrontMaxY = 650;
+
+    /// <summary>每次找花最多存几张截图（只在没找到花时保存，转第一圈时每转大约 45 度存一张）（第 10 版）。</summary>
+    private const int PrivateServerFlowerScreenshotsPerSearch = 8;
+
+    /// <summary>截图文件夹里最多留几张，超过时删掉最早的（第 10 版）。</summary>
+    private const int PrivateServerFlowerScreenshotsKeep = 48;
+
+    // 下面是按“深色叶子 + 红紫色花苞”找花时用的颜色范围和大小（第 10 版，按你发来的截图调的，一般不用改）。
+    // 颜色按 OpenCV 的 HSV 表示：H（色调）0～180，S（饱和度）、V（亮度）0～255；像素数量按截图缩小到 960×540 后统计。
+
+    // 深色叶子（墨绿～深蓝色）：色调范围、饱和度下限、亮度上限（叶子比地面暗）
+    private const int PrivateServerLeafMinHue = 40;
+    private const int PrivateServerLeafMaxHue = 125;
+    private const int PrivateServerLeafMinSaturation = 45;
+    private const int PrivateServerLeafMaxValue = 95;
+
+    // 红紫色花苞和花纹：色调在 PrivateServerBudMinHue 以上（紫红色）或 PrivateServerBudMaxRedHue 以下（红色），饱和度比红褐色泥土更高
+    private const int PrivateServerBudMinHue = 125;
+    private const int PrivateServerBudMaxRedHue = 8;
+    private const int PrivateServerBudMinSaturation = 100;
+    private const int PrivateServerBudMinValue = 50;
+    private const int PrivateServerBudMaxValue = 235;
+
+    // 一块里至少要有多少深色叶子像素、多少红紫色像素；两种颜色里少的那种至少占这一块的多少（只有一种颜色的不算）
+    private const int PrivateServerFlowerMinLeafPixels = 60;
+    private const int PrivateServerFlowerMinBudPixels = 25;
+    private const double PrivateServerFlowerMinCueShare = 0.05;
+
+    // 这一块的长宽比最多多少（太扁的是地上的条纹、悬崖边）、最多多少像素（太大的是大片地形）、把靠得很近的像素连成一块的范围
+    private const double PrivateServerFlowerMaxAspect = 3.0;
+    private const int PrivateServerFlowerMaxBlobPixels = 30000;
+    private const int PrivateServerFlowerMergeSize = 9;
+
+    /// <summary>按叶子和花苞找花时忽略的区域（1080P）：小地图、右上角按钮、队伍列表、下方按钮和血条、技能图标、角色本身（第 10 版）。</summary>
+    private static readonly Rect[] PrivateServerLeafBudIgnoreRects =
+    [
+        new(0, 0, 330, 320), new(1450, 0, 470, 120), new(1560, 230, 360, 400),
+        new(0, 960, 1920, 120), new(1600, 880, 320, 200), new(820, 360, 280, 540)
+    ];
+
     /// <summary>找花的阶段（第 9 版）。</summary>
     private enum PrivateServerFlowerPhase
     {
@@ -3860,10 +3949,12 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     }
 
     /// <summary>
-    /// 第 9 版找花：视角回正后，原地慢慢转视角寻找征讨之花（头顶图标，或者花身上的红色花纹），
-    /// 最多转 PrivateServerFlowerScanRounds 圈，转的时候不走动；找到后原地对准，再按住前进直线走过去，路上每隔一会儿按一次交互键。
+    /// 第 9 版找花：视角回正后，原地慢慢转视角寻找征讨之花，最多转 PrivateServerFlowerScanRounds 圈，转的时候不走动；
+    /// 找到后原地对准，再按住前进直线走过去，路上每隔一会儿按一次交互键。
     /// 看到“接触征讨之花”后停下，按一次交互键等结果；按了 3 次都没有弹出领奖界面，就按本周次数已用完处理（同第 8 版）。
-    /// 进入领奖界面、或确认本周次数已用完时返回；转完几圈都没有找到时抛出 TimeoutException。
+    /// 第 10 版：找之前先把镜头拉远、视角朝下看（PrivateServerZoomOutAndLookDown）；头顶没有图标的花改按深色叶子和红紫色花苞找；
+    /// 只在游戏主界面（左上角能看到派蒙）时才认花；最多朝 PrivateServerMaxApproachAttempts 个目标走过去；找完把视角回正。
+    /// 进入领奖界面、或确认本周次数已用完时返回；没有找到时抛出 TimeoutException。
     /// </summary>
     private async Task PrivateServerScanAndApproachFlower()
     {
@@ -3880,6 +3971,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         var phase = PrivateServerFlowerPhase.Scan;
         double scannedDegrees = 0;
         var roundsLogged = 0;
+        var scanSteps = 0;
         double? candidateX = null;
         var lastSeenAt = DateTime.MinValue;
         var walkStartedAt = DateTime.MinValue;
@@ -3887,8 +3979,17 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         var lastInteractAt = DateTime.MinValue;
         var lastPromptPressAt = DateTime.MinValue;
         var unansweredPresses = 0;
+        var approachAttempts = 0;
         double? lastAimFromX = null;
         double lastAimMovePx = 0;
+        var cameraTilted = false;
+        var tiltChecked = false;
+        double tiltPx = 0;
+        var reachedPanel = false;
+        DateTime? notInWorldSince = null;
+        var notInWorldLogged = false;
+        var screenshots = new List<byte[]>();
+        var lastShotStep = -1;
         var stopwatch = Stopwatch.StartNew();
 
         // 画面上的横坐标 → 相对画面中心的角度（度）
@@ -3911,6 +4012,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
         try
         {
+            if (PrivateServerZoomOutAndLookDown)
+            {
+                // 第 10 版：镜头拉远（滚轮往下），再把视角往下转一些，让画面里主要是地面
+                tiltPx = await PrivateServerZoomOutAndLookDownCamera(pxPerDegree);
+                cameraTilted = true;
+            }
+
             while (true)
             {
                 _ct.ThrowIfCancellationRequested();
@@ -3924,6 +4032,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 {
                     if (HasRewardPanelPrompt(page) || IsRewardPanelOpen(page))
                     {
+                        reachedPanel = true;
                         _logger.LogInformation("{Name}：已进入征讨之花领奖界面", Name);
                         return;
                     }
@@ -3940,6 +4049,15 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 if (HasRewardInteractionPrompt(page))
                 {
                     StopWalking();
+                    if (cameraTilted)
+                    {
+                        // 第 10 版：已经走到花跟前了，先把视角回正，再按交互键
+                        Simulation.SendInput.Mouse.MiddleButtonClick();
+                        cameraTilted = false;
+                        _logger.LogInformation("{Name}：已经走到征讨之花跟前，视角回正", Name);
+                        await Delay(300, _ct);
+                    }
+
                     if (DateTime.UtcNow - lastPromptPressAt >= TimeSpan.FromMilliseconds(PrivateServerInteractRetryMs))
                     {
                         if (lastPromptPressAt != DateTime.MinValue)
@@ -3966,26 +4084,70 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                     continue;
                 }
 
-                // 3. 在画面里找花（头顶图标优先，其次花身上的红色花纹）
-                bool found;
-                bool byIcon;
-                double targetX;
-                float? angleBefore;
+                // 3. 在画面里找花（头顶图标优先，其次按深色叶子和红紫色花苞找）；只在游戏主界面（能看到派蒙）时才认
+                var found = false;
+                var byIcon = false;
+                double targetX = 0;
+                float? angleBefore = null;
+                bool inWorld;
                 using (var capture = CaptureToRectArea())
                 {
-                    found = PrivateServerFindFlowerTarget(capture, rewardBox, height, out targetX, out byIcon);
-                    angleBefore = PrivateServerTryGetCameraAngle(capture);
+                    using (var paimon = capture.Find(BetterGenshinImpact.GameTask.Common.Element.Assets.ElementRecognition.Get("PaimonMenu", capture)))
+                    {
+                        inWorld = paimon.IsExist();
+                    }
+
+                    if (inWorld)
+                    {
+                        found = PrivateServerFindFlowerTarget(capture, rewardBox, height, out targetX, out byIcon);
+                        angleBefore = PrivateServerTryGetCameraAngle(capture);
+
+                        // 转第一圈时每转大约 45 度存一张截图（没找到花时才写到硬盘上）
+                        if (PrivateServerSaveFlowerSearchScreenshots && !found && phase == PrivateServerFlowerPhase.Scan
+                            && scanSteps % 3 == 0 && scanSteps != lastShotStep && screenshots.Count < PrivateServerFlowerScreenshotsPerSearch)
+                        {
+                            lastShotStep = scanSteps;
+                            var jpg = PrivateServerEncodeHalfSizeJpeg(capture.SrcMat);
+                            if (jpg != null)
+                            {
+                                screenshots.Add(jpg);
+                            }
+                        }
+                    }
                 }
 
-                // 按图标找到时把图标放在画面正中间；按红色花纹找到时把花放在角色右侧一点（花在正中间会被角色挡住）
-                var aimX = byIcon ? centerX : centerX * PrivateServerFlowerAimRatio;
-                var tolerance = byIcon ? width * 0.04 : centerX * (PrivateServerFlowerAimMaxRatio - PrivateServerFlowerAimMinRatio) / 2;
+                if (!inWorld)
+                {
+                    // 第 10 版：不在游戏主界面（左上角看不到派蒙，例如弹出了别的界面）时，不认花、不走动，等一会儿再看
+                    StopWalking();
+                    if (phase == PrivateServerFlowerPhase.Approach)
+                    {
+                        phase = PrivateServerFlowerPhase.Aim;
+                    }
+
+                    lastSeenAt = DateTime.UtcNow;
+                    notInWorldSince ??= DateTime.UtcNow;
+                    if (!notInWorldLogged && DateTime.UtcNow - notInWorldSince > TimeSpan.FromSeconds(5))
+                    {
+                        notInWorldLogged = true;
+                        _logger.LogInformation("{Name}：现在不在游戏主界面（左上角看不到派蒙），先等一下再找征讨之花", Name);
+                    }
+
+                    await Delay(300, _ct);
+                    continue;
+                }
+
+                notInWorldSince = null;
+
+                // 第 10 版：不管按图标还是按叶子和花苞找到，都把花放在画面正中间（视角朝下看时，正前方的花在角色头顶上方）
+                var aimX = centerX;
+                var tolerance = width * 0.04;
 
                 if (phase == PrivateServerFlowerPhase.Scan)
                 {
                     if (found)
                     {
-                        // 按红色花纹找到时，原地停一下再看一眼，两次都在同一个位置看到才算（免得把别的红色东西当成花）
+                        // 按叶子和花苞找到时，原地停一下再看一眼，两次都在同一个位置看到才算（免得把别的东西当成花）
                         if (!byIcon && (candidateX is not { } firstX || Math.Abs(firstX - targetX) > 150))
                         {
                             candidateX = targetX;
@@ -3999,7 +4161,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                         roundsLogged = 0;
                         lastAimFromX = null;
                         phase = PrivateServerFlowerPhase.Aim;
-                        _logger.LogInformation("{Name}：找到了征讨之花（{How}），先对准，再直线走过去", Name, byIcon ? "头顶图标" : "红色花纹");
+                        _logger.LogInformation("{Name}：找到了征讨之花（{How}），先对准，再直线走过去", Name, byIcon ? "头顶图标" : "叶子和花苞");
                         continue;
                     }
 
@@ -4012,6 +4174,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                     // 慢慢转一小步，再看小地图上的视角方向实际转了多少度
                     var stepPx = pxPerDegree * PrivateServerFlowerScanStepDegrees;
                     await PrivateServerTurnCameraSmoothly(stepPx);
+                    scanSteps++;
                     await Delay(200, _ct);
                     float? angleAfter;
                     using (var after = CaptureToRectArea())
@@ -4022,8 +4185,22 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                     var turned = PrivateServerAngleBetween(angleBefore, angleAfter);
                     if (turned is >= 3 and <= 90)
                     {
-                        pxPerDegree = Math.Clamp(pxPerDegree * 0.5 + stepPx / turned.Value * 0.5, 0.5, 60);
+                        var measured = Math.Clamp(stepPx / turned.Value, 0.5, 60);
+                        pxPerDegree = Math.Clamp(pxPerDegree * 0.5 + measured * 0.5, 0.5, 60);
                         scannedDegrees += turned.Value;
+
+                        // 第 10 版：第一次量出实际的鼠标灵敏度后，按实际灵敏度修正一次往下看的角度
+                        if (cameraTilted && !tiltChecked)
+                        {
+                            tiltChecked = true;
+                            var wantedPx = PrivateServerLookDownDegrees * measured;
+                            if (Math.Abs(wantedPx - tiltPx) >= Math.Max(10, tiltPx * 0.3))
+                            {
+                                await PrivateServerTurnCameraSmoothly(0, wantedPx - tiltPx);
+                                tiltPx = wantedPx;
+                                await Delay(200, _ct);
+                            }
+                        }
                     }
                     else
                     {
@@ -4072,6 +4249,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                     if (Math.Abs(targetX - aimX) <= tolerance)
                     {
                         // 已经对准：按住前进直线走过去
+                        approachAttempts++;
                         Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
                         isWalking = true;
                         walkStartedAt = DateTime.UtcNow;
@@ -4111,6 +4289,11 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 else if (DateTime.UtcNow - lastSeenAt > TimeSpan.FromMilliseconds(PrivateServerApproachLostMs))
                 {
                     StopWalking();
+                    if (approachAttempts >= PrivateServerMaxApproachAttempts)
+                    {
+                        throw new TimeoutException($"朝征讨之花走了 {approachAttempts} 次都没有走到跟前");
+                    }
+
                     phase = PrivateServerFlowerPhase.Scan;
                     _logger.LogInformation("{Name}：走的途中看不到征讨之花了，停下来重新转视角寻找", Name);
                     continue;
@@ -4119,6 +4302,11 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 if (DateTime.UtcNow - walkStartedAt > TimeSpan.FromSeconds(PrivateServerApproachMaxWalkSeconds))
                 {
                     StopWalking();
+                    if (approachAttempts >= PrivateServerMaxApproachAttempts)
+                    {
+                        throw new TimeoutException($"朝征讨之花走了 {approachAttempts} 次都没有走到跟前");
+                    }
+
                     phase = PrivateServerFlowerPhase.Scan;
                     _logger.LogInformation("{Name}：走了 {Seconds} 秒还没走到征讨之花跟前，停下来重新寻找", Name, PrivateServerApproachMaxWalkSeconds);
                     continue;
@@ -4133,16 +4321,57 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 await Delay(100, _ct);
             }
         }
+        catch (TimeoutException)
+        {
+            // 第 10 版：没找到花时，把找花时看到的画面存下来，方便以后调整识别
+            PrivateServerSaveFlowerScreenshotsToLog(screenshots);
+            throw;
+        }
         finally
         {
             StopWalking();
             Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+            if (cameraTilted)
+            {
+                if (reachedPanel)
+                {
+                    // 已经进了领奖界面，这时按中键没有用：等下一轮开打前再把视角回正
+                    _psCameraNeedsReset = true;
+                }
+                else
+                {
+                    Simulation.SendInput.Mouse.MiddleButtonClick();
+                    _logger.LogInformation("{Name}：视角回正", Name);
+                }
+            }
         }
     }
 
     /// <summary>
+    /// 第 10 版：滚轮往下滚 PrivateServerZoomOutScrollClicks 格把镜头拉远，再把视角往下转大约 PrivateServerLookDownDegrees 度，
+    /// 让画面里主要是地面（减少远处地形、天空、光影的干扰），角色在画面里也小一些，不容易挡住花。
+    /// </summary>
+    /// <param name="pxPerDegree">鼠标移动多少像素视角转 1 度（估计值，转第一步后会按实际测量修正一次）。</param>
+    /// <returns>往下移动鼠标的像素。</returns>
+    private async Task<double> PrivateServerZoomOutAndLookDownCamera(double pxPerDegree)
+    {
+        for (var i = 0; i < PrivateServerZoomOutScrollClicks; i++)
+        {
+            Simulation.SendInput.Mouse.VerticalScroll(-1);
+            await Delay(40, _ct);
+        }
+
+        await Delay(300, _ct);
+        var tiltPx = Math.Max(0, PrivateServerLookDownDegrees) * pxPerDegree;
+        await PrivateServerTurnCameraSmoothly(0, tiltPx);
+        await Delay(300, _ct);
+        _logger.LogInformation("{Name}：镜头拉远并朝下看（滚轮往下 {Clicks} 格，视角往下约 {Degrees} 度）", Name, PrivateServerZoomOutScrollClicks, PrivateServerLookDownDegrees);
+        return tiltPx;
+    }
+
+    /// <summary>
     /// 在截图里找征讨之花：先找头顶的图标（图标在画面下方时花在身后，不算找到），
-    /// 没有图标时按花身上的红色花纹找（需要开启 PrivateServerFindFlowerWithoutIcon）。（第 9 版）
+    /// 没有图标时按深色叶子和红紫色花苞找（需要开启 PrivateServerFindFlowerWithoutIcon；在角色身边或身后的不算）。（第 9、10 版）
     /// </summary>
     /// <param name="capture">当前截图（1080P）。</param>
     /// <param name="rewardBox">头顶图标的模板。</param>
@@ -4168,22 +4397,220 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             }
         }
 
-        return PrivateServerFindFlowerWithoutIcon && PrivateServerTryFindFlowerByColor(capture, out targetX, out _);
+        if (!PrivateServerFindFlowerWithoutIcon)
+        {
+            return false;
+        }
+
+        var src = capture.SrcMat;
+        if (!PrivateServerTryFindFlowerByLeafAndBud(src, out targetX, out var targetY, out _, out _))
+        {
+            return false;
+        }
+
+        return targetY * 1080.0 / src.Height < PrivateServerLeafBudFrontMaxY;
     }
 
-    /// <summary>分 5 次慢慢移动鼠标转动视角（大约 150 毫秒），不会一下子转很多（第 9 版）。</summary>
+    /// <summary>
+    /// 第 10 版：按“深色叶子 + 红紫色花苞”找征讨之花（头顶没有图标时用）。
+    /// 把深色叶子的像素和红紫色（花苞、花纹）的像素连成一块一块；某一块里两种颜色都够多、形状不太扁、大小合适，就当作征讨之花，
+    /// 有好几块时选两种颜色都最多的那块。小地图、按钮、队伍列表、技能图标和角色本身所在的区域不看。
+    /// 只看一种颜色时，红褐色的泥土、岩浆、深色的石头都容易被认错；两种颜色挨在一起的，在你发来的截图里只有征讨之花。
+    /// </summary>
+    /// <param name="src">当前截图。</param>
+    /// <param name="targetX">花在截图中的 X 坐标（这一块的中心）。</param>
+    /// <param name="targetY">花在截图中的 Y 坐标（这一块的中心）。</param>
+    /// <param name="leafPixels">这一块里深色叶子的像素数量（缩小到 960×540 后统计）。</param>
+    /// <param name="budPixels">这一块里红紫色的像素数量（缩小到 960×540 后统计）。</param>
+    private static bool PrivateServerTryFindFlowerByLeafAndBud(Mat src, out double targetX, out double targetY, out int leafPixels, out int budPixels)
+    {
+        targetX = 0;
+        targetY = 0;
+        leafPixels = 0;
+        budPixels = 0;
+        if (src.Empty() || src.Width < 2 || src.Height < 2)
+        {
+            return false;
+        }
+
+        using var bgr = PrivateServerCropBgr(src, new Rect(0, 0, src.Width, src.Height));
+        using var small = new Mat();
+        Cv2.Resize(bgr, small, new Size(bgr.Width / 2, bgr.Height / 2), 0, 0, InterpolationFlags.Area);
+        using var hsv = new Mat();
+        Cv2.CvtColor(small, hsv, ColorConversionCodes.BGR2HSV);
+
+        using var leaf = new Mat();
+        Cv2.InRange(hsv, new Scalar(PrivateServerLeafMinHue, PrivateServerLeafMinSaturation, 0),
+            new Scalar(PrivateServerLeafMaxHue, 255, PrivateServerLeafMaxValue), leaf);
+        using var budPurple = new Mat();
+        using var budRed = new Mat();
+        using var bud = new Mat();
+        Cv2.InRange(hsv, new Scalar(PrivateServerBudMinHue, PrivateServerBudMinSaturation, PrivateServerBudMinValue),
+            new Scalar(180, 255, PrivateServerBudMaxValue), budPurple);
+        Cv2.InRange(hsv, new Scalar(0, PrivateServerBudMinSaturation, PrivateServerBudMinValue),
+            new Scalar(PrivateServerBudMaxRedHue, 255, PrivateServerBudMaxValue), budRed);
+        Cv2.BitwiseOr(budPurple, budRed, bud);
+
+        // 不看小地图、按钮、队伍列表、技能图标和角色本身
+        var k = small.Width / 1920.0;
+        var bounds = new Rect(0, 0, small.Width, small.Height);
+        foreach (var r in PrivateServerLeafBudIgnoreRects)
+        {
+            var scaled = new Rect((int)(r.X * k), (int)(r.Y * k), (int)Math.Ceiling(r.Width * k) + 1, (int)Math.Ceiling(r.Height * k) + 1) & bounds;
+            if (scaled.Width <= 0 || scaled.Height <= 0)
+            {
+                continue;
+            }
+
+            using (var leafPart = new Mat(leaf, scaled))
+            {
+                leafPart.SetTo(Scalar.Black);
+            }
+
+            using (var budPart = new Mat(bud, scaled))
+            {
+                budPart.SetTo(Scalar.Black);
+            }
+        }
+
+        // 把靠得很近的叶子和花苞像素连成一块
+        using var both = new Mat();
+        Cv2.BitwiseOr(leaf, bud, both);
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(PrivateServerFlowerMergeSize, PrivateServerFlowerMergeSize));
+        using var merged = new Mat();
+        Cv2.MorphologyEx(both, merged, MorphTypes.Close, kernel);
+        using var labels = new Mat();
+        using var stats = new Mat();
+        using var centroids = new Mat();
+        var count = Cv2.ConnectedComponentsWithStats(merged, labels, stats, centroids, PixelConnectivity.Connectivity8);
+
+        var bestScore = 0;
+        for (var i = 1; i < count; i++)
+        {
+            var x = stats.At<int>(i, 0);
+            var y = stats.At<int>(i, 1);
+            var w = stats.At<int>(i, 2);
+            var h = stats.At<int>(i, 3);
+            var area = stats.At<int>(i, 4);
+            if (w <= 0 || h <= 0 || area < PrivateServerFlowerMinLeafPixels + PrivateServerFlowerMinBudPixels || area > PrivateServerFlowerMaxBlobPixels)
+            {
+                continue;
+            }
+
+            if (Math.Max(w / (double)h, h / (double)w) > PrivateServerFlowerMaxAspect)
+            {
+                continue;
+            }
+
+            // 数一数这一块里分别有多少叶子像素、多少花苞像素
+            var box = new Rect(x, y, w, h);
+            using var labelPart = new Mat(labels, box);
+            using var component = new Mat();
+            Cv2.InRange(labelPart, new Scalar(i), new Scalar(i), component);
+            using var leafPart2 = new Mat(leaf, box);
+            using var budPart2 = new Mat(bud, box);
+            using var leafIn = new Mat();
+            using var budIn = new Mat();
+            Cv2.BitwiseAnd(leafPart2, component, leafIn);
+            Cv2.BitwiseAnd(budPart2, component, budIn);
+            var leafCount = Cv2.CountNonZero(leafIn);
+            var budCount = Cv2.CountNonZero(budIn);
+            if (leafCount < PrivateServerFlowerMinLeafPixels || budCount < PrivateServerFlowerMinBudPixels
+                || Math.Min(leafCount, budCount) < PrivateServerFlowerMinCueShare * (leafCount + budCount))
+            {
+                continue;
+            }
+
+            var score = Math.Min(leafCount, budCount);
+            if (score <= bestScore)
+            {
+                continue;
+            }
+
+            bestScore = score;
+            leafPixels = leafCount;
+            budPixels = budCount;
+            targetX = (x + w / 2.0) / small.Width * src.Width;
+            targetY = (y + h / 2.0) / small.Height * src.Height;
+        }
+
+        return bestScore > 0;
+    }
+
+    /// <summary>把截图缩小一半、压缩成 JPG（第 10 版，没找到花时保存用）；失败时返回 null。</summary>
+    private static byte[]? PrivateServerEncodeHalfSizeJpeg(Mat src)
+    {
+        try
+        {
+            if (src.Empty() || src.Width < 2 || src.Height < 2)
+            {
+                return null;
+            }
+
+            using var bgr = PrivateServerCropBgr(src, new Rect(0, 0, src.Width, src.Height));
+            using var small = new Mat();
+            Cv2.Resize(bgr, small, new Size(bgr.Width / 2, bgr.Height / 2), 0, 0, InterpolationFlags.Area);
+            Cv2.ImEncode(".jpg", small, out var buffer, new ImageEncodingParam(ImwriteFlags.JpegQuality, 85));
+            return buffer;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 第 10 版：没找到征讨之花时，把找花时看到的画面保存到 BetterGI 文件夹里的 log\pserver_flower（文件夹里最多留 PrivateServerFlowerScreenshotsKeep 张，
+    /// 多了删掉最早的）。以后还是经常找不到时，可以把这些图片发出来，用来调整识别。
+    /// </summary>
+    /// <param name="images">已经压缩好的截图。</param>
+    private void PrivateServerSaveFlowerScreenshotsToLog(List<byte[]> images)
+    {
+        if (!PrivateServerSaveFlowerSearchScreenshots || images.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var folder = Global.Absolute(@"log\pserver_flower");
+            Directory.CreateDirectory(folder);
+            var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+            for (var i = 0; i < images.Count; i++)
+            {
+                File.WriteAllBytes(Path.Combine(folder, $"{stamp}-{i + 1}.jpg"), images[i]);
+            }
+
+            foreach (var old in new DirectoryInfo(folder).GetFiles("*.jpg").OrderByDescending(f => f.Name, StringComparer.Ordinal).Skip(PrivateServerFlowerScreenshotsKeep))
+            {
+                old.Delete();
+            }
+
+            _logger.LogInformation("{Name}：没找到征讨之花，找花时看到的画面已保存到 {Folder}（{Count} 张）", Name, folder, images.Count);
+        }
+        catch (Exception e)
+        {
+            _logger.LogDebug(e, "{Name}：保存找花截图失败", Name);
+        }
+    }
+
+    /// <summary>分 5 次慢慢移动鼠标转动视角（大约 150 毫秒），不会一下子转很多（第 9 版；第 10 版加了上下方向）。</summary>
     /// <param name="pixels">鼠标横向移动的像素，正数向右转。</param>
-    private async Task PrivateServerTurnCameraSmoothly(double pixels)
+    /// <param name="verticalPixels">鼠标纵向移动的像素，正数往下看。</param>
+    private async Task PrivateServerTurnCameraSmoothly(double pixels, double verticalPixels = 0)
     {
         const int pieces = 5;
-        var moved = 0;
+        var movedX = 0;
+        var movedY = 0;
         for (var i = 1; i <= pieces; i++)
         {
-            var target = (int)Math.Round(pixels * i / pieces);
-            if (target != moved)
+            var targetX = (int)Math.Round(pixels * i / pieces);
+            var targetY = (int)Math.Round(verticalPixels * i / pieces);
+            if (targetX != movedX || targetY != movedY)
             {
-                Simulation.SendInput.Mouse.MoveMouseBy(target - moved, 0);
-                moved = target;
+                Simulation.SendInput.Mouse.MoveMouseBy(targetX - movedX, targetY - movedY);
+                movedX = targetX;
+                movedY = targetY;
             }
 
             await Delay(30, _ct);
