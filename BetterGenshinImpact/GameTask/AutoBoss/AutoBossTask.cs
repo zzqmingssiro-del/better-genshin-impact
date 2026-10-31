@@ -3888,7 +3888,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// 视角回正后再往下看多少度（第 10 版）。数字越大，画面里地面越多、干扰越少，但看到的范围越近，
     /// 太大时离得稍远的花会看不到（往下看到底时只能看到身边 5 米左右）。
     /// </summary>
-    private const double PrivateServerLookDownDegrees = 40;
+    private const double PrivateServerLookDownDegrees = 50;
 
     /// <summary>一次找花最多朝几个目标走过去；都没有走到花跟前，就当作这次没找到，免得被认错的东西带着到处走（第 10 版）。</summary>
     private const int PrivateServerMaxApproachAttempts = 4;
