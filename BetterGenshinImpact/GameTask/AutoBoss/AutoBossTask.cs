@@ -85,6 +85,8 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     // 点击“前往”→“传送并追踪”，再用 BetterGI 自带的路线前往并继续讨伐。
     // 需要先完成前置任务的、附近没有解锁传送锚点的、BetterGI 不支持的、写在跳过名单（User\私服跳过的首领.txt）里的首领会自动跳过。
     // 另外，有些首领的征讨之花头顶没有图标，原来的找花方法找不到就会结束任务；现在找不到图标时改为按花身上的红色花纹寻找。
+    // 第 9 版：战斗结束后先原地慢慢转视角找花（转的时候不走动），找到后对准直线走过去；转完几圈还找不到，
+    // 就传送到首领附近的传送锚点、按 BetterGI 自带的路线重新跑到首领那里再找一次，还找不到就换下一个首领。
     // 下面几个开关改完需要重新编译。
 
     /// <summary>征讨之花提示“本周收取该宝藏次数已耗尽”时，是否按冒险之证首领列表顺序自动换下一个首领继续讨伐（关闭时直接结束任务）。</summary>
@@ -98,6 +100,16 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
     /// <summary>征讨之花头顶没有图标时，是否改为按征讨之花身上的红色花纹寻找（还找不到时回到首领位置再找一次）。</summary>
     private static readonly bool PrivateServerFindFlowerWithoutIcon = true;
+
+    /// <summary>
+    /// 战斗结束后是否先原地慢慢转视角找征讨之花（最多转 3 圈，转的时候不走动），找到后对准、直线走过去，路上多按几次交互键；
+    /// 转完还找不到时，传送到首领附近的传送锚点、按 BetterGI 自带的路线重新跑到首领那里再找一次，还找不到就换下一个首领。
+    /// 改成 false：用第 5～8 版的找法（找不到图标时按红色花纹边走边找，容易跑出首领区域）。（第 9 版）
+    /// </summary>
+    private static readonly bool PrivateServerSlowScanForFlower = true;
+
+    /// <summary>本轮原地转了几圈、重新跑图后都没有找到征讨之花（第 9 版）。</summary>
+    private volatile bool _psFlowerNotFound;
 
     /// <summary>本轮在征讨之花处看到了“本周收取该宝藏次数已耗尽”。</summary>
     private volatile bool _psWeeklyLimitReached;
@@ -224,6 +236,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         _rewardSummary.Clear();
         _successfulRewardCount = 0;
         _psWeeklyLimitReached = false;
+        _psFlowerNotFound = false;
         _psStartSelectionDone = false;
         _psSkipListLogged = false;
         Validate();
@@ -317,7 +330,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             //5.开始战斗
             await RunAutoFight();
             
-            //6.寻路到征讨之花（私服：找不到时回到首领位置再找一次）
+            //6.寻路到征讨之花（私服：找不到时传送回来按路线重新跑一遍再找；还找不到就换下一个首领）
             await PrivateServerNavigateToReward();
 
             // 私服：征讨之花提示“本周收取该宝藏次数已耗尽” → 按冒险之证的顺序换下一个首领
@@ -332,6 +345,18 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 continue;
             }
             
+            // 私服：原地转了几圈、重新跑图后都没有找到征讨之花 → 按冒险之证的顺序换下一个首领（第 9 版）
+            if (_psFlowerNotFound)
+            {
+                if (!await PrivateServerHandleFlowerNotFound())
+                {
+                    break;
+                }
+
+                shouldNavigateToBoss = true;
+                continue;
+            }
+
             //7.交互征讨之花
             bool rewardSuccess;
             // 私服：领奖（包括补充树脂）是自己的界面操作，这期间后台检查不把原石图标当作空月祝福的“获得”界面
@@ -1296,6 +1321,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <exception cref="TimeoutException">长时间无法找到或靠近征讨之花时抛出。</exception>
     private async Task NavigateToReward()
     {
+        // 私服：战斗结束后先原地慢慢转视角找花，找到后对准直线走过去（第 9 版）
+        if (PrivateServerSlowScanForFlower)
+        {
+            await PrivateServerScanAndApproachFlower();
+            return;
+        }
+
         using var navigationCts = CancellationTokenSource.CreateLinkedTokenSource(_ct);
         var page = new BvPage(navigationCts.Token);
 
@@ -2616,13 +2648,37 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     }
 
     /// <summary>
-    /// 寻找征讨之花；超时找不到时（例如头顶没有图标、花在视野外），先回到首领路线终点附近，再找一次。
+    /// 寻找征讨之花。
+    /// 第 9 版（PrivateServerSlowScanForFlower）：原地转了几圈都没找到时，传送到首领附近的传送锚点、按 BetterGI 自带的路线重新跑到首领那里再找一次；
+    /// 还找不到就设置 _psFlowerNotFound，由 RunBossLoop 换下一个首领。
+    /// 关掉第 9 版时：超时找不到时（例如头顶没有图标、花在视野外），先回到首领路线终点附近，再找一次。
     /// </summary>
     private async Task PrivateServerNavigateToReward()
     {
         try
         {
             await NavigateToReward();
+        }
+        catch (TimeoutException e) when (PrivateServerSlowScanForFlower)
+        {
+            // 私服（第 9 版）：原地转了几圈都没找到 → 传送到首领附近的传送锚点，按 BetterGI 自带的路线重新跑到首领那里，再找一次
+            _logger.LogWarning("{Name}：{Message}，传送到附近的传送锚点，按路线重新跑到首领那里再找一次", Name, e.Message);
+            if (!await EnsureCleanMainUi(new BvPage(_ct), "重新跑图前"))
+            {
+                throw;
+            }
+
+            await NavigateToBoss();
+            try
+            {
+                await NavigateToReward();
+            }
+            catch (TimeoutException again)
+            {
+                // 还是没找到：交给 RunBossLoop 换下一个首领
+                _logger.LogWarning("{Name}：{Message}，重新跑图后还是没有找到征讨之花", Name, again.Message);
+                _psFlowerNotFound = true;
+            }
         }
         catch (TimeoutException e) when (PrivateServerFindFlowerWithoutIcon && !AutoBossData.IsNoPathingSupportBoss(_taskParam.BossName))
         {
@@ -3759,6 +3815,417 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         }
 
         return PrivateServerTeleportResult.Failed;
+    }
+
+    // ---------- 第 9 版：战斗结束后原地慢慢转视角找征讨之花，找到后对准直线走过去 ----------
+
+    /// <summary>原地转视角找花时最多转几圈（第 9 版）。</summary>
+    private const int PrivateServerFlowerScanRounds = 3;
+
+    /// <summary>原地转视角找花时每一步转多少度，数字越小转得越慢（第 9 版）。</summary>
+    private const double PrivateServerFlowerScanStepDegrees = 15;
+
+    /// <summary>往花走的路上，每隔多少毫秒按一次交互键（第 9 版）。</summary>
+    private const int PrivateServerApproachInteractIntervalMs = 600;
+
+    /// <summary>往花走的路上，看不到花超过多少毫秒就停下来重新找（第 9 版）。</summary>
+    private const int PrivateServerApproachLostMs = 1500;
+
+    /// <summary>一次最多连续走多少秒；还没走到花跟前就停下来重新找，免得跑出首领区域（第 9 版）。</summary>
+    private const int PrivateServerApproachMaxWalkSeconds = 8;
+
+    /// <summary>一次找花（包括走过去）最多用多少秒（第 9 版）。</summary>
+    private const int PrivateServerFlowerSearchMaxSeconds = 120;
+
+    /// <summary>鼠标移动多少像素视角转 1 度的初始估计值；转动时会用小地图上的视角方向实际测量并修正（第 9 版）。</summary>
+    private const double PrivateServerInitialMousePxPerDegree = 5.3;
+
+    /// <summary>画面横向的视野角度，用来把花在画面上的位置换算成要转的角度（第 9 版）。</summary>
+    private const double PrivateServerHorizontalFovDegrees = 73;
+
+    /// <summary>头顶图标在画面这个高度（比例）以下时，说明花在身后，不算找到，继续转（第 9 版）。</summary>
+    private const double PrivateServerFlowerIconFrontMaxRatio = 0.7;
+
+    /// <summary>找花的阶段（第 9 版）。</summary>
+    private enum PrivateServerFlowerPhase
+    {
+        /// <summary>原地慢慢转视角找花（不走动）。</summary>
+        Scan,
+
+        /// <summary>找到了花，原地转视角对准。</summary>
+        Aim,
+
+        /// <summary>已经对准，按住前进直线走过去。</summary>
+        Approach
+    }
+
+    /// <summary>
+    /// 第 9 版找花：视角回正后，原地慢慢转视角寻找征讨之花（头顶图标，或者花身上的红色花纹），
+    /// 最多转 PrivateServerFlowerScanRounds 圈，转的时候不走动；找到后原地对准，再按住前进直线走过去，路上每隔一会儿按一次交互键。
+    /// 看到“接触征讨之花”后停下，按一次交互键等结果；按了 3 次都没有弹出领奖界面，就按本周次数已用完处理（同第 8 版）。
+    /// 进入领奖界面、或确认本周次数已用完时返回；转完几圈都没有找到时抛出 TimeoutException。
+    /// </summary>
+    private async Task PrivateServerScanAndApproachFlower()
+    {
+        var page = new BvPage(_ct);
+        var captureRect = TaskContext.Instance().SystemInfo.ScaleMax1080PCaptureRect;
+        var width = (double)captureRect.Width;
+        var height = (double)captureRect.Height;
+        var centerX = width / 2.0;
+        var focal = centerX / Math.Tan(PrivateServerHorizontalFovDegrees / 2 * Math.PI / 180);
+        var rewardBox = LoadRecognitionObject("RewardBox");
+        var climbRect = ScaleRect(1686, 1030, 60, 23);
+
+        var pxPerDegree = PrivateServerInitialMousePxPerDegree;
+        var phase = PrivateServerFlowerPhase.Scan;
+        double scannedDegrees = 0;
+        var roundsLogged = 0;
+        double? candidateX = null;
+        var lastSeenAt = DateTime.MinValue;
+        var walkStartedAt = DateTime.MinValue;
+        var isWalking = false;
+        var lastInteractAt = DateTime.MinValue;
+        var lastPromptPressAt = DateTime.MinValue;
+        var unansweredPresses = 0;
+        double? lastAimFromX = null;
+        double lastAimMovePx = 0;
+        var stopwatch = Stopwatch.StartNew();
+
+        // 画面上的横坐标 → 相对画面中心的角度（度）
+        double AngleOf(double x) => Math.Atan((x - centerX) / focal) * 180 / Math.PI;
+
+        void StopWalking()
+        {
+            if (isWalking)
+            {
+                Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+                isWalking = false;
+            }
+        }
+
+        _logger.LogInformation("{Name}：开始寻找征讨之花：原地慢慢转视角找（最多转 {Rounds} 圈），找到后对准直线走过去", Name, PrivateServerFlowerScanRounds);
+
+        // 视角回正（鼠标中键）：视角回到角色身后的默认高度（BetterGI 寻找地脉花奖励时也是这样做的）
+        Simulation.SendInput.Mouse.MiddleButtonClick();
+        await Delay(500, _ct);
+
+        try
+        {
+            while (true)
+            {
+                _ct.ThrowIfCancellationRequested();
+                if (stopwatch.Elapsed > TimeSpan.FromSeconds(PrivateServerFlowerSearchMaxSeconds))
+                {
+                    throw new TimeoutException("寻找征讨之花超时");
+                }
+
+                // 1. 按过交互键后：看是否进入了领奖界面、是否提示本周次数已用完
+                if (lastInteractAt != DateTime.MinValue)
+                {
+                    if (HasRewardPanelPrompt(page) || IsRewardPanelOpen(page))
+                    {
+                        _logger.LogInformation("{Name}：已进入征讨之花领奖界面", Name);
+                        return;
+                    }
+
+                    if (DateTime.UtcNow - lastInteractAt < TimeSpan.FromSeconds(4) && HasWeeklyLimitToast(page))
+                    {
+                        _psWeeklyLimitReached = true;
+                        _logger.LogInformation("{Name}：征讨之花提示“本周收取该宝藏次数已耗尽”", Name);
+                        return;
+                    }
+                }
+
+                // 2. 出现“接触征讨之花”：已经在花跟前，停下来，按一次交互键等结果
+                if (HasRewardInteractionPrompt(page))
+                {
+                    StopWalking();
+                    if (DateTime.UtcNow - lastPromptPressAt >= TimeSpan.FromMilliseconds(PrivateServerInteractRetryMs))
+                    {
+                        if (lastPromptPressAt != DateTime.MinValue)
+                        {
+                            unansweredPresses++;
+                            if (unansweredPresses >= PrivateServerUnansweredInteractLimit)
+                            {
+                                _logger.LogWarning("{Name}：按了 {Count} 次交互键都没有弹出领奖界面（也没认出提示文字），按“本周收取该宝藏次数已耗尽”处理",
+                                    Name, unansweredPresses);
+                                _psWeeklyLimitReached = true;
+                                _logger.LogInformation("{Name}：征讨之花提示“本周收取该宝藏次数已耗尽”", Name);
+                                return;
+                            }
+
+                            _logger.LogInformation("{Name}：按交互键后没有弹出领奖界面，再按一次", Name);
+                        }
+
+                        Simulation.SendInput.SimulateAction(GIActions.PickUpOrInteract);
+                        lastPromptPressAt = DateTime.UtcNow;
+                        lastInteractAt = lastPromptPressAt;
+                    }
+
+                    await Delay(150, _ct);
+                    continue;
+                }
+
+                // 3. 在画面里找花（头顶图标优先，其次花身上的红色花纹）
+                bool found;
+                bool byIcon;
+                double targetX;
+                float? angleBefore;
+                using (var capture = CaptureToRectArea())
+                {
+                    found = PrivateServerFindFlowerTarget(capture, rewardBox, height, out targetX, out byIcon);
+                    angleBefore = PrivateServerTryGetCameraAngle(capture);
+                }
+
+                // 按图标找到时把图标放在画面正中间；按红色花纹找到时把花放在角色右侧一点（花在正中间会被角色挡住）
+                var aimX = byIcon ? centerX : centerX * PrivateServerFlowerAimRatio;
+                var tolerance = byIcon ? width * 0.04 : centerX * (PrivateServerFlowerAimMaxRatio - PrivateServerFlowerAimMinRatio) / 2;
+
+                if (phase == PrivateServerFlowerPhase.Scan)
+                {
+                    if (found)
+                    {
+                        // 按红色花纹找到时，原地停一下再看一眼，两次都在同一个位置看到才算（免得把别的红色东西当成花）
+                        if (!byIcon && (candidateX is not { } firstX || Math.Abs(firstX - targetX) > 150))
+                        {
+                            candidateX = targetX;
+                            await Delay(300, _ct);
+                            continue;
+                        }
+
+                        candidateX = null;
+                        lastSeenAt = DateTime.UtcNow;
+                        scannedDegrees = 0;
+                        roundsLogged = 0;
+                        lastAimFromX = null;
+                        phase = PrivateServerFlowerPhase.Aim;
+                        _logger.LogInformation("{Name}：找到了征讨之花（{How}），先对准，再直线走过去", Name, byIcon ? "头顶图标" : "红色花纹");
+                        continue;
+                    }
+
+                    candidateX = null;
+                    if (scannedDegrees >= 360.0 * PrivateServerFlowerScanRounds)
+                    {
+                        throw new TimeoutException($"原地转了 {PrivateServerFlowerScanRounds} 圈也没有找到征讨之花");
+                    }
+
+                    // 慢慢转一小步，再看小地图上的视角方向实际转了多少度
+                    var stepPx = pxPerDegree * PrivateServerFlowerScanStepDegrees;
+                    await PrivateServerTurnCameraSmoothly(stepPx);
+                    await Delay(200, _ct);
+                    float? angleAfter;
+                    using (var after = CaptureToRectArea())
+                    {
+                        angleAfter = PrivateServerTryGetCameraAngle(after);
+                    }
+
+                    var turned = PrivateServerAngleBetween(angleBefore, angleAfter);
+                    if (turned is >= 3 and <= 90)
+                    {
+                        pxPerDegree = Math.Clamp(pxPerDegree * 0.5 + stepPx / turned.Value * 0.5, 0.5, 60);
+                        scannedDegrees += turned.Value;
+                    }
+                    else
+                    {
+                        scannedDegrees += PrivateServerFlowerScanStepDegrees;
+                    }
+
+                    var rounds = (int)(scannedDegrees / 360);
+                    if (rounds > roundsLogged && rounds < PrivateServerFlowerScanRounds)
+                    {
+                        roundsLogged = rounds;
+                        _logger.LogInformation("{Name}：已经原地转了 {Rounds} 圈，还没找到征讨之花，继续转", Name, rounds);
+                    }
+
+                    continue;
+                }
+
+                if (phase == PrivateServerFlowerPhase.Aim)
+                {
+                    if (!found)
+                    {
+                        if (DateTime.UtcNow - lastSeenAt > TimeSpan.FromMilliseconds(1200))
+                        {
+                            phase = PrivateServerFlowerPhase.Scan;
+                            _logger.LogInformation("{Name}：看不到征讨之花了，继续转视角寻找", Name);
+                        }
+                        else
+                        {
+                            await Delay(150, _ct);
+                        }
+
+                        continue;
+                    }
+
+                    lastSeenAt = DateTime.UtcNow;
+                    // 根据上一次转动后花在画面上移动了多少，修正“鼠标移动多少像素转 1 度”
+                    if (lastAimFromX is { } fromX && Math.Abs(lastAimMovePx) >= 8)
+                    {
+                        var moved = AngleOf(fromX) - AngleOf(targetX);
+                        if (Math.Abs(moved) >= 1 && Math.Sign(moved) == Math.Sign(lastAimMovePx))
+                        {
+                            pxPerDegree = Math.Clamp(pxPerDegree * 0.5 + lastAimMovePx / moved * 0.5, 0.5, 60);
+                        }
+                    }
+
+                    lastAimFromX = null;
+                    if (Math.Abs(targetX - aimX) <= tolerance)
+                    {
+                        // 已经对准：按住前进直线走过去
+                        Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
+                        isWalking = true;
+                        walkStartedAt = DateTime.UtcNow;
+                        phase = PrivateServerFlowerPhase.Approach;
+                        continue;
+                    }
+
+                    var aimPx = Math.Clamp((AngleOf(targetX) - AngleOf(aimX)) * pxPerDegree * 0.8, -pxPerDegree * 60, pxPerDegree * 60);
+                    await PrivateServerTurnCameraSmoothly(aimPx);
+                    lastAimFromX = targetX;
+                    lastAimMovePx = aimPx;
+                    await Delay(250, _ct);
+                    continue;
+                }
+
+                // 4. 正在走过去：边走边微调方向，路上每隔一会儿按一次交互键
+                if (page.Locator("Space", climbRect).IsExist())
+                {
+                    StopWalking();
+                    _logger.LogInformation("{Name}：检测到攀爬状态，尝试脱离", Name);
+                    Simulation.SendInput.SimulateAction(GIActions.Drop);
+                    await Delay(1000, _ct);
+                    phase = PrivateServerFlowerPhase.Scan;
+                    continue;
+                }
+
+                if (found)
+                {
+                    lastSeenAt = DateTime.UtcNow;
+                    if (Math.Abs(targetX - aimX) > tolerance)
+                    {
+                        // 边走边转的幅度小一些，免得左右摇摆
+                        var steerPx = Math.Clamp((AngleOf(targetX) - AngleOf(aimX)) * pxPerDegree * 0.5, -pxPerDegree * 15, pxPerDegree * 15);
+                        Simulation.SendInput.Mouse.MoveMouseBy((int)Math.Round(steerPx), 0);
+                    }
+                }
+                else if (DateTime.UtcNow - lastSeenAt > TimeSpan.FromMilliseconds(PrivateServerApproachLostMs))
+                {
+                    StopWalking();
+                    phase = PrivateServerFlowerPhase.Scan;
+                    _logger.LogInformation("{Name}：走的途中看不到征讨之花了，停下来重新转视角寻找", Name);
+                    continue;
+                }
+
+                if (DateTime.UtcNow - walkStartedAt > TimeSpan.FromSeconds(PrivateServerApproachMaxWalkSeconds))
+                {
+                    StopWalking();
+                    phase = PrivateServerFlowerPhase.Scan;
+                    _logger.LogInformation("{Name}：走了 {Seconds} 秒还没走到征讨之花跟前，停下来重新寻找", Name, PrivateServerApproachMaxWalkSeconds);
+                    continue;
+                }
+
+                if (DateTime.UtcNow - lastInteractAt >= TimeSpan.FromMilliseconds(PrivateServerApproachInteractIntervalMs))
+                {
+                    Simulation.SendInput.SimulateAction(GIActions.PickUpOrInteract);
+                    lastInteractAt = DateTime.UtcNow;
+                }
+
+                await Delay(100, _ct);
+            }
+        }
+        finally
+        {
+            StopWalking();
+            Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+        }
+    }
+
+    /// <summary>
+    /// 在截图里找征讨之花：先找头顶的图标（图标在画面下方时花在身后，不算找到），
+    /// 没有图标时按花身上的红色花纹找（需要开启 PrivateServerFindFlowerWithoutIcon）。（第 9 版）
+    /// </summary>
+    /// <param name="capture">当前截图（1080P）。</param>
+    /// <param name="rewardBox">头顶图标的模板。</param>
+    /// <param name="height">截图高度。</param>
+    /// <param name="targetX">花（或图标）在截图中的 X 坐标。</param>
+    /// <param name="byIcon">是不是按头顶图标找到的。</param>
+    private static bool PrivateServerFindFlowerTarget(ImageRegion capture, RecognitionObject rewardBox, double height, out double targetX, out bool byIcon)
+    {
+        targetX = 0;
+        byIcon = false;
+        using (var icon = capture.Find(rewardBox))
+        {
+            if (icon.IsExist())
+            {
+                if (icon.Y + icon.Height / 2.0 >= height * PrivateServerFlowerIconFrontMaxRatio)
+                {
+                    return false;
+                }
+
+                targetX = icon.X + icon.Width / 2.0;
+                byIcon = true;
+                return true;
+            }
+        }
+
+        return PrivateServerFindFlowerWithoutIcon && PrivateServerTryFindFlowerByColor(capture, out targetX, out _);
+    }
+
+    /// <summary>分 5 次慢慢移动鼠标转动视角（大约 150 毫秒），不会一下子转很多（第 9 版）。</summary>
+    /// <param name="pixels">鼠标横向移动的像素，正数向右转。</param>
+    private async Task PrivateServerTurnCameraSmoothly(double pixels)
+    {
+        const int pieces = 5;
+        var moved = 0;
+        for (var i = 1; i <= pieces; i++)
+        {
+            var target = (int)Math.Round(pixels * i / pieces);
+            if (target != moved)
+            {
+                Simulation.SendInput.Mouse.MoveMouseBy(target - moved, 0);
+                moved = target;
+            }
+
+            await Delay(30, _ct);
+        }
+    }
+
+    /// <summary>两次视角方向之间相差多少度（0～180）；任意一次没识别出来时返回 null（第 9 版）。</summary>
+    private static double? PrivateServerAngleBetween(float? before, float? after)
+    {
+        if (before is not { } a || after is not { } b)
+        {
+            return null;
+        }
+
+        var diff = Math.Abs(b - a) % 360;
+        return diff > 180 ? 360 - diff : diff;
+    }
+
+    /// <summary>
+    /// 原地转了几圈、传送回来按路线重新跑到首领那里后，还是没有找到征讨之花：
+    /// 开启首领轮换时，按冒险之证顺序换下一个首领；否则结束任务（第 9 版）。
+    /// </summary>
+    /// <returns>已换到下一个首领时返回 true；需要结束任务时返回 false。</returns>
+    private async Task<bool> PrivateServerHandleFlowerNotFound()
+    {
+        _psFlowerNotFound = false;
+        _logger.LogWarning("{Name}：{Boss} 的征讨之花找了两次都没有找到", Name, _taskParam.BossName);
+        if (!PrivateServerBossRotation)
+        {
+            _logger.LogInformation("{Name}：没有开启首领轮换，结束任务", Name);
+            return false;
+        }
+
+        var nextBoss = await PrivateServerSelectBossInHandbook(advance: true);
+        if (nextBoss == null)
+        {
+            return false;
+        }
+
+        _logger.LogInformation("{Name}：换成讨伐 {Boss}", Name, nextBoss);
+        _taskParam.BossName = nextBoss;
+        return true;
     }
 
     // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）结束 ====================
