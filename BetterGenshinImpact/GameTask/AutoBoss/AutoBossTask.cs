@@ -89,6 +89,8 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     // 就传送到首领附近的传送锚点、按 BetterGI 自带的路线重新跑到首领那里再找一次，还找不到就换下一个首领。
     // 第 10 版：找花前先把镜头拉远（滚轮往下）、视角朝下看，让画面里主要是地面；头顶没有图标的花改按深色叶子和红紫色花苞找，
     // 减少光影和地形颜色的干扰；走到花跟前（或者没找到）时把视角回正。
+    // 第 11 版：战斗中检测到游泳、角色被击败等，BetterGI 传送到七天神像时，这一轮不找征讨之花（以前会在神像旁边找花，
+    // 容易摔下山或者和神像交互卡住），重新前往同一个首领再打；打完后也会用小地图确认角色还在首领附近。
     // 下面几个开关改完需要重新编译。
 
     /// <summary>征讨之花提示“本周收取该宝藏次数已耗尽”时，是否按冒险之证首领列表顺序自动换下一个首领继续讨伐（关闭时直接结束任务）。</summary>
@@ -127,6 +129,28 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
     /// <summary>找花时视角朝下看过、还没来得及回正（例如直接进了领奖界面），下一轮开打前要先回正（第 10 版）。</summary>
     private volatile bool _psCameraNeedsReset;
+
+    /// <summary>
+    /// 战斗中被传送到七天神像（BetterGI 检测到游泳、角色被击败时会这样做）、路线没跑完、或者打完后角色不在首领附近时，
+    /// 是否放弃这一轮（不找征讨之花），重新前往同一个首领再打。同一个首领连续中断的次数超过 BetterGI 自动首领讨伐设置里的
+    /// “角色死亡后重试次数”（默认 3）时，换下一个首领（没开首领轮换时结束任务）。改成 false：恢复第 10 版的做法。（第 11 版）
+    /// </summary>
+    private static readonly bool PrivateServerRetryInterruptedRound = true;
+
+    /// <summary>
+    /// 用小地图确认位置时，离首领路线终点超过这么多米，就认为角色被传送走了（第 11 版）。
+    /// 各首领离最近的七天神像都在 118 米以上，正常打完时角色一般在终点 50 米以内。
+    /// </summary>
+    private const double PrivateServerAwayFromBossMeters = 100;
+
+    /// <summary>当前首领连续中断（没能正常打完）的次数（第 11 版）。</summary>
+    private int _psInterruptedRounds;
+
+    /// <summary>_psInterruptedRounds 记的是哪个首领（第 11 版）。</summary>
+    private string? _psInterruptedBoss;
+
+    /// <summary>最近一次跑的路线有没有完整跑完（第 11 版）。</summary>
+    private bool _psLastRouteFinished = true;
 
     /// <summary>本轮在征讨之花处看到了“本周收取该宝藏次数已耗尽”。</summary>
     private volatile bool _psWeeklyLimitReached;
@@ -256,6 +280,9 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         _psFlowerNotFound = false;
         _psCameraNeedsReset = false;
         _psStartSelectionDone = false;
+        _psInterruptedRounds = 0;
+        _psInterruptedBoss = null;
+        _psLastRouteFinished = true;
         _psSkipListLogged = false;
         Validate();
         LogScreenResolution();
@@ -353,12 +380,55 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             {
                 await NavigateToBoss();
             }
-            
+
+            // 私服（第 11 版）：路线没跑完（中途回七天神像回血、多次卡住后放弃等）、战斗中被传送到七天神像（检测到游泳、角色被击败等）、
+            // 或者打完后角色不在首领附近时，这一轮不找征讨之花，重新前往同一个首领再打
+            string? psInterruptReason = null;
+            var psRouteFinished = _psLastRouteFinished;
+            _psLastRouteFinished = true;
+            if (!psRouteFinished)
+            {
+                psInterruptReason = await PrivateServerCheckAwayFromBoss("路线没有跑完，");
+            }
+
             //5.开始战斗
-            await RunAutoFight();
-            
+            if (psInterruptReason == null)
+            {
+                try
+                {
+                    await RunAutoFight();
+                }
+                catch (RetryException e) when (PrivateServerRetryInterruptedRound)
+                {
+                    psInterruptReason = $"战斗中被传送到了七天神像（{e.Message}）";
+                }
+
+                psInterruptReason ??= await PrivateServerCheckAwayFromBoss("打完后");
+            }
+
             //6.寻路到征讨之花（私服：找不到时传送回来按路线重新跑一遍再找；还找不到就换下一个首领）
-            await PrivateServerNavigateToReward();
+            if (psInterruptReason == null)
+            {
+                try
+                {
+                    await PrivateServerNavigateToReward();
+                }
+                catch (RetryException e) when (PrivateServerRetryInterruptedRound)
+                {
+                    psInterruptReason = e.Message;
+                }
+            }
+
+            if (psInterruptReason != null)
+            {
+                if (!await PrivateServerHandleInterruptedRound(psInterruptReason))
+                {
+                    break;
+                }
+
+                shouldNavigateToBoss = true;
+                continue;
+            }
 
             // 私服：征讨之花提示“本周收取该宝藏次数已耗尽” → 按冒险之证的顺序换下一个首领
             if (_psWeeklyLimitReached)
@@ -410,6 +480,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             }
 
             _successfulRewardCount++;
+            _psInterruptedRounds = 0;
             _taskParam.RewardClaimedCallback?.Invoke();
             if (!ShouldContinueBeforeRound())
             {
@@ -1136,6 +1207,12 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         {
             _logger.LogInformation("战斗操作中断：{Msg}", e.Message);
         }
+        catch (RetryException) when (PrivateServerRetryInterruptedRound)
+        {
+            // 私服（第 11 版）：战斗中检测到游泳、角色被击败时，BetterGI 已经传送到了七天神像（RetryException）。
+            // 原来这里会把它当成普通异常吞掉，接着就在七天神像旁边找征讨之花；现在交给 RunBossLoop，重新前往首领再打
+            throw;
+        }
         catch (Exception e)
         {
             _logger.LogWarning("JSON战斗任务异常：{Msg}", e.Message);
@@ -1314,6 +1391,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             PartyConfig = BuildPathingPartyConfig()
         };
         await executor.Pathing(task);
+        // 私服（第 11 版）：记下这条路线有没有完整跑完（例如中途回七天神像回血、多次卡住后放弃），开打前会确认角色是否在首领附近
+        _psLastRouteFinished = executor.SuccessEnd;
+        if (!executor.SuccessEnd)
+        {
+            _logger.LogWarning("{Name}：路线 {Route} 没有完整跑完", Name,
+                string.IsNullOrWhiteSpace(task.Info.Name) ? task.FileName : task.Info.Name);
+        }
     }
 
     /// <summary>
@@ -3888,7 +3972,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// 视角回正后再往下看多少度（第 10 版）。数字越大，画面里地面越多、干扰越少，但看到的范围越近，
     /// 太大时离得稍远的花会看不到（往下看到底时只能看到身边 5 米左右）。
     /// </summary>
-    private const double PrivateServerLookDownDegrees = 100;
+    private const double PrivateServerLookDownDegrees = 25;
 
     /// <summary>一次找花最多朝几个目标走过去；都没有走到花跟前，就当作这次没找到，免得被认错的东西带着到处走（第 10 版）。</summary>
     private const int PrivateServerMaxApproachAttempts = 4;
@@ -4046,7 +4130,16 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                 }
 
                 // 2. 出现“接触征讨之花”：已经在花跟前，停下来，按一次交互键等结果
-                if (HasRewardInteractionPrompt(page))
+                var promptTexts = PrivateServerReadInteractionPrompts(page);
+                if (PrivateServerRetryInterruptedRound && promptTexts.Any(text => text.Contains("神像", StringComparison.Ordinal)))
+                {
+                    // 第 11 版：交互提示是“七天神像”，说明现在在七天神像旁边、不在首领附近（征讨之花不会在神像旁边）：
+                    // 不按交互键，这一轮不找花了，交给 RunBossLoop 重新前往首领再打
+                    StopWalking();
+                    throw new RetryException("找征讨之花时走到了七天神像旁边，现在不在首领附近");
+                }
+
+                if (promptTexts.Any(text => text.Contains("接触征讨之花", StringComparison.Ordinal)))
                 {
                     StopWalking();
                     if (cameraTilted)
@@ -4653,6 +4746,135 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         _logger.LogInformation("{Name}：换成讨伐 {Boss}", Name, nextBoss);
         _taskParam.BossName = nextBoss;
         return true;
+    }
+
+    // ---------- 第 11 版：战斗中被传送到七天神像（游泳、角色被击败等）、或者打完后不在首领附近时，这一轮不找花，重新前往首领再打 ----------
+
+    /// <summary>
+    /// 第 11 版：用小地图认出角色现在的位置，和这个首领路线（{首领}前往.json）的终点比较。
+    /// 隔一小会儿认两次，两次都离终点超过 PrivateServerAwayFromBossMeters 米时，返回原因文字（说明角色被传送走了，例如回了七天神像）；
+    /// 在首领附近、认不出位置、不在游戏主界面、不是大世界（提瓦特）里的普通路线首领时，都返回 null（照常继续）。
+    /// </summary>
+    /// <param name="when">原因文字的开头，例如“打完后”。</param>
+    private async Task<string?> PrivateServerCheckAwayFromBoss(string when)
+    {
+        if (!PrivateServerRetryInterruptedRound || AutoBossData.IsNoPathingSupportBoss(_taskParam.BossName))
+        {
+            return null;
+        }
+
+        try
+        {
+            var route = PathingTask.BuildFromFilePath(BuildPathingAssetPath($"{_taskParam.BossName}前往.json"));
+            var end = route?.Positions.LastOrDefault();
+            if (route == null || end == null || route.Info.MapName != "Teyvat")
+            {
+                return null;
+            }
+
+            var map = BetterGenshinImpact.GameTask.Common.Map.Maps.MapManager.GetMap(route.Info.MapName, route.Info.MapMatchMethod);
+            double meters = 0;
+            for (var i = 0; i < 2; i++)
+            {
+                if (i > 0)
+                {
+                    await Delay(800, _ct);
+                }
+
+                // 刚打完时可能还在放技能的动画里，等一下游戏主界面（最多约 3 秒）
+                var inMainUi = false;
+                for (var wait = 0; wait < 6 && !inMainUi; wait++)
+                {
+                    if (wait > 0)
+                    {
+                        await Delay(500, _ct);
+                    }
+
+                    using var uiCapture = CaptureToRectArea();
+                    inMainUi = Bv.IsInMainUi(uiCapture);
+                }
+
+                if (!inMainUi)
+                {
+                    return null;
+                }
+
+                using var capture = CaptureToRectArea();
+                var position = Navigation.GetPositionStable(capture, route.Info.MapName, route.Info.MapMatchMethod);
+                if (position == default || map.ConvertImageCoordinatesToGenshinMapCoordinates(position) is not { } game)
+                {
+                    return null;
+                }
+
+                meters = Math.Sqrt(Math.Pow(game.X - end.X, 2) + Math.Pow(game.Y - end.Y, 2));
+                if (meters <= PrivateServerAwayFromBossMeters)
+                {
+                    return null;
+                }
+            }
+
+            return $"{when}角色离 {_taskParam.BossName} 有 {meters:F0} 米远（可能被传送到了七天神像）";
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            _logger.LogDebug(e, "{Name}：确认角色是否在首领附近时出错，照常继续", Name);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 第 11 版：这一轮讨伐中断了（战斗中被传送到七天神像、路线没跑完、打完后不在首领附近等）：不找征讨之花，重新前往同一个首领再打。
+    /// 同一个首领连续中断的次数超过 BetterGI 自动首领讨伐设置里的“角色死亡后重试次数”（默认 3）时，
+    /// 开启首领轮换的话按冒险之证顺序换下一个首领，否则结束任务。领到一次奖励后重新计数。
+    /// </summary>
+    /// <returns>继续讨伐（同一个首领或者下一个首领）时返回 true；需要结束任务时返回 false。</returns>
+    private async Task<bool> PrivateServerHandleInterruptedRound(string reason)
+    {
+        if (_psInterruptedBoss != _taskParam.BossName)
+        {
+            _psInterruptedBoss = _taskParam.BossName;
+            _psInterruptedRounds = 0;
+        }
+
+        _psInterruptedRounds++;
+        var maxRetries = Math.Max(0, _taskParam.ReviveRetryCount);
+        if (_psInterruptedRounds <= maxRetries)
+        {
+            _logger.LogWarning("{Name}：{Reason}，这一轮不找征讨之花，重新前往 {Boss} 再打一次（第 {Count}/{Max} 次）",
+                Name, reason, _taskParam.BossName, _psInterruptedRounds, maxRetries);
+            return await EnsureCleanMainUi(new BvPage(_ct), "重新前往首领前");
+        }
+
+        _logger.LogWarning("{Name}：{Reason}。{Boss} 已经连续 {Count} 次没能正常打完（次数上限用的是“角色死亡后重试次数”这个设置）",
+            Name, reason, _taskParam.BossName, _psInterruptedRounds);
+        _psInterruptedRounds = 0;
+        if (!PrivateServerBossRotation)
+        {
+            _logger.LogInformation("{Name}：没有开启首领轮换，结束任务", Name);
+            return false;
+        }
+
+        if (!await EnsureCleanMainUi(new BvPage(_ct), "换下一个首领前"))
+        {
+            return false;
+        }
+
+        var nextBoss = await PrivateServerSelectBossInHandbook(advance: true);
+        if (nextBoss == null)
+        {
+            return false;
+        }
+
+        _logger.LogInformation("{Name}：换成讨伐 {Boss}", Name, nextBoss);
+        _taskParam.BossName = nextBoss;
+        return true;
+    }
+
+    /// <summary>第 11 版：读一次右侧交互提示区域里的文字（和 HasRewardInteractionPrompt 是同一块区域）。</summary>
+    private List<string> PrivateServerReadInteractionPrompts(BvPage page)
+    {
+        var promptRect = ScaleRect(1210, 300, 200, 400);
+        return page.Ocr(promptRect).Select(region => region.Text).ToList();
     }
 
     // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）结束 ====================
