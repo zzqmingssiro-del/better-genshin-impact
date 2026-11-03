@@ -79,7 +79,7 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
 
     /// <summary>
     /// 私服进入秘境后不会出现“地脉异常 / 点击任意位置关闭”的秘境提示。原版每一轮开始都要等这个提示，等不到就在原地白等 40 秒左右。
-    /// true：不再等秘境提示，秘境载入完成（左上角能看到派蒙）后马上去钥匙处启动。改成 false：恢复原版的做法。修改后需要重新编译。
+    /// true：不再等秘境提示，秘境载入完成（左上角出现“退出秘境”按钮）后马上去钥匙处启动。改成 false：恢复原版的做法。修改后需要重新编译。
     /// </summary>
     private static readonly bool PrivateServerSkipDomainTip = true;
 
@@ -275,7 +275,7 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
         for (var i = 0; i < _taskParam.DomainRoundNum; i++)
         {
             // 0. 关闭秘境提示
-            // 私服：私服的秘境不会出现秘境提示，原版要在原地白等 40 秒左右；改为等秘境载入完成（能看到派蒙）就开始
+            // 私服：私服的秘境不会出现秘境提示，原版要在原地白等 40 秒左右；改为等秘境载入完成（左上角出现“退出秘境”按钮）就开始
             if (PrivateServerSkipDomainTip)
             {
                 Logger.LogDebug("0. 等待秘境载入完成（私服：不等秘境提示）");
@@ -769,17 +769,19 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
 
     /// <summary>
     /// 私服：代替 CloseDomainTip，不等“地脉异常”秘境提示。
-    /// 1. 先等载入画面出现：点了“开始挑战”或“继续挑战”后，画面会切到载入画面（左上角看不到派蒙），最多等 5 秒；
-    /// 2. 再等秘境载入完成：连续两次看到派蒙（游戏主界面），最多等 60 秒；
+    /// 注意：秘境里左上角没有派蒙，派蒙的位置换成了“退出秘境”按钮（门加箭头的图标），所以两种都要认。
+    /// （第 12 版只认派蒙，在秘境里永远等不到，每一轮都白等满 60 秒；第 13 版修正。）
+    /// 1. 先等载入画面出现：点了“开始挑战”或“继续挑战”后，画面会切到载入画面（左上角既没有派蒙也没有退出秘境按钮），最多等 5 秒；
+    /// 2. 再等秘境载入完成：连续两次看到游戏界面（秘境里是左上角的退出秘境按钮，大世界是派蒙），最多等 60 秒；
     /// 3. 再等 1 秒让画面稳定。万一画面中间出现了“地脉异常 / 点击任意位置关闭”，点一下关掉（只看一次，不等待）。
     /// </summary>
     private async Task PrivateServerWaitForDomainLoaded()
     {
-        // 1. 等载入画面出现（看不到派蒙）
+        // 1. 等载入画面出现（左上角既没有派蒙，也没有退出秘境按钮）
         for (var i = 0; i < 10; i++)
         {
             using var ra = CaptureToRectArea();
-            if (!Bv.IsInMainUi(ra))
+            if (!PrivateServerIsGameUiVisible(ra))
             {
                 break;
             }
@@ -787,23 +789,23 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
             await Delay(500, _ct);
         }
 
-        // 2. 等秘境载入完成（连续两次看到派蒙）
-        var mainUiSeen = 0;
+        // 2. 等秘境载入完成（连续两次看到游戏界面）
+        var uiSeen = 0;
         var waitStart = DateTime.Now;
-        while (mainUiSeen < 2 && DateTime.Now - waitStart < TimeSpan.FromSeconds(60))
+        while (uiSeen < 2 && DateTime.Now - waitStart < TimeSpan.FromSeconds(60))
         {
             await Delay(500, _ct);
             using var ra = CaptureToRectArea();
-            mainUiSeen = Bv.IsInMainUi(ra) ? mainUiSeen + 1 : 0;
+            uiSeen = PrivateServerIsGameUiVisible(ra) ? uiSeen + 1 : 0;
         }
 
-        if (mainUiSeen < 2)
+        if (uiSeen < 2)
         {
-            Logger.LogWarning("自动秘境：等了 60 秒还没看到游戏主界面（左上角的派蒙），直接继续");
+            Logger.LogWarning("自动秘境：等了 60 秒还没看到秘境界面（左上角的“退出秘境”按钮），直接继续");
         }
         else
         {
-            Logger.LogInformation("自动秘境：{Text}", "秘境已载入（私服：不等秘境提示）");
+            Logger.LogInformation("自动秘境：秘境已载入，等了 {Seconds} 秒（私服：不等秘境提示）", Math.Round((DateTime.Now - waitStart).TotalSeconds, 1));
         }
 
         await Delay(1000, _ct);
@@ -820,6 +822,15 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
             tip.Dispose();
             await Delay(500, _ct);
         }
+    }
+
+    /// <summary>
+    /// 私服：能不能看到游戏界面。大世界看左上角的派蒙；秘境里左上角没有派蒙，看“退出秘境”按钮。
+    /// 和原版其他地方的写法一样（Bv.IsInMainUi || Bv.IsInDomain）。
+    /// </summary>
+    private static bool PrivateServerIsGameUiVisible(ImageRegion ra)
+    {
+        return Bv.IsInMainUi(ra) || Bv.IsInDomain(ra);
     }
 
     // ==================== 私服：自动秘境不等秘境提示（自定义修改）结束 ====================
