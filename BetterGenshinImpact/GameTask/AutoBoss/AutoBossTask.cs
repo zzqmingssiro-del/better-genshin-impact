@@ -91,6 +91,8 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     // 减少光影和地形颜色的干扰；走到花跟前（或者没找到）时把视角回正。
     // 第 11 版：战斗中检测到游泳、角色被击败等，BetterGI 传送到七天神像时，这一轮不找征讨之花（以前会在神像旁边找花，
     // 容易摔下山或者和神像交互卡住），重新前往同一个首领再打；打完后也会用小地图确认角色还在首领附近。
+    // 第 14 版：只刷“刷取名单”（User\私服刷取的首领.txt）里写了的首领；征讨之花头顶没有宝箱图标的首领，打完后直接走到名单里记下的花的坐标去领，
+    // 不再按像素找花（头顶有宝箱图标的花还是原地转视角按图标找）；战斗中第一次检测到游泳时先游回首领那里接着打，第二次才回七天神像。
     // 下面几个开关改完需要重新编译。
 
     /// <summary>征讨之花提示“本周收取该宝藏次数已耗尽”时，是否按冒险之证首领列表顺序自动换下一个首领继续讨伐（关闭时直接结束任务）。</summary>
@@ -105,8 +107,9 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <summary>
     /// 征讨之花头顶没有图标时，是否改为按花本身的样子寻找：第 5～8 版的找法按花身上的红色花纹找（还找不到时回到首领位置再找一次）；
     /// 第 9 版的找法（PrivateServerSlowScanForFlower）里，第 10 版起改为按深色叶子和红紫色花苞找。
+    /// 第 14 版起默认关闭（false）：没有宝箱图标的花改为走到刷取名单里记下的坐标（PrivateServerGoToFlowerCoordinates），不再按像素找。
     /// </summary>
-    private static readonly bool PrivateServerFindFlowerWithoutIcon = true;
+    private static readonly bool PrivateServerFindFlowerWithoutIcon = false;
 
     /// <summary>
     /// 战斗结束后是否先原地慢慢转视角找征讨之花（最多转 3 圈，转的时候不走动），找到后对准、直线走过去，路上多按几次交互键；
@@ -121,8 +124,9 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <summary>
     /// 找征讨之花前，是否先把镜头拉远（滚轮往下滚）、视角朝下看，让画面里主要是地面：远处的地形、天空、光影干扰少了，角色也不容易挡住花。
     /// 走到花跟前（或者没找到）时按一下鼠标中键把视角回正；镜头拉远后不会再拉近。只在 PrivateServerSlowScanForFlower 为 true 时有效。（第 10 版）
+    /// 第 14 版起默认关闭（false）：这是为按像素找花准备的；有宝箱图标的花，平视时更容易看到头顶的图标（和第 9 版一样）。
     /// </summary>
-    private static readonly bool PrivateServerZoomOutAndLookDown = true;
+    private static readonly bool PrivateServerZoomOutAndLookDown = false;
 
     /// <summary>没找到征讨之花时，是否把找花时看到的画面保存到 BetterGI 文件夹里的 log\pserver_flower（每次最多 8 张），方便以后调整识别。（第 10 版）</summary>
     private static readonly bool PrivateServerSaveFlowerSearchScreenshots = true;
@@ -205,6 +209,84 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
     /// <summary>本次任务是否已经在日志里列出过跳过名单。</summary>
     private bool _psSkipListLogged;
+    /// <summary>
+    /// 是否只刷“刷取名单”里写了名字的首领（第 14 版）。名单文件在 BetterGI 安装目录的 User 文件夹里（User\私服刷取的首领.txt），
+    /// 文件不存在时按下面的默认内容自动创建。名单里有名字时：首领轮换只选名单里的首领（顺序还是按冒险之证里的顺序），
+    /// 不在名单里的都跳过，跳过名单（User\私服跳过的首领.txt）不再使用；名单里一个名字都没有（全部加了 #）时，和以前一样按跳过名单跳过。
+    /// </summary>
+    private static readonly bool PrivateServerUseFarmList = true;
+
+    /// <summary>
+    /// 刷取名单里写了征讨之花坐标的首领（花的头顶没有宝箱图标），打完后是否直接走到这个坐标领奖（第 14 版）。
+    /// 走到后按交互键；没看到“接触征讨之花”时在坐标附近小范围绕圈找；还找不到就传送到附近的传送锚点、按路线重新跑一遍再走一次，
+    /// 还不行就换下一个首领。没写坐标的首领（花的头顶有宝箱图标）还是原地转视角按图标找。
+    /// </summary>
+    private static readonly bool PrivateServerGoToFlowerCoordinates = true;
+
+    /// <summary>离记下的坐标这么近（米）才算走到了（第 14 版）。记坐标时站在花旁边，所以走到这里一般就能看到“接触征讨之花”。</summary>
+    private const double PrivateServerFlowerPointArriveMeters = 0.8;
+
+    /// <summary>打完后离记下的坐标超过这么多米，就认为小地图认错了位置（或者坐标记错了），不走过去（第 14 版）。</summary>
+    private const double PrivateServerFlowerPointMaxMeters = 150;
+
+    /// <summary>坐标上没看到“接触征讨之花”时，在附近绕圈找：每一步的米数（第 14 版）。</summary>
+    private const double PrivateServerFlowerSpiralStepMeters = 1.5;
+
+    /// <summary>坐标上没看到“接触征讨之花”时，在附近绕圈找：最远离坐标多少米（第 14 版）。</summary>
+    private const double PrivateServerFlowerSpiralMaxMeters = 4.5;
+
+    /// <summary>
+    /// 战斗中检测到游泳时，是否先游回首领那里接着打（第 14 版）。开打前把首领的位置（路线终点；没有路线坐标的首领用名单里记下的花的坐标）
+    /// 告诉 BetterGI 的游泳检测：同一场战斗里第一次检测到游泳时，BetterGI 会过 0.8 秒再确认一次，然后朝首领的位置游回去（最多约 15 秒），
+    /// 游回岸上就接着打，不回七天神像；第二次检测到游泳才回七天神像（之后按第 11 版重新前往同一个首领再打）。
+    /// 改成 false：恢复以前的做法（第一次检测到游泳就直接回七天神像）。
+    /// </summary>
+    private static readonly bool PrivateServerSwimBackToBossFirst = true;
+
+    /// <summary>刷取名单文件（第 14 版）。用记事本修改后保存即可，下次换首领时生效，不需要重新编译。</summary>
+    private const string PrivateServerFarmListFileName = @"User\私服刷取的首领.txt";
+
+    /// <summary>刷取名单文件的默认内容（第 14 版，按你发来的名单和坐标）。</summary>
+    private static readonly string[] PrivateServerFarmListFileDefaultLines =
+    [
+        "# 私服刷取名单（第 14 版）：只刷这里写了名字的首领，没写的都跳过。",
+        "# 换首领的顺序还是按冒险之证里的顺序（从左到右、从上到下），和这里写的先后无关。",
+        "# 每行写一个首领：名字后面写征讨之花的坐标（x,y 两个数字）；花的头顶有宝箱图标的首领不用写坐标。",
+        "# 名字要和冒险之证里的一样（空格和“·”可以不写）。",
+        "# 一行里 # 后面的内容不生效（是说明文字）：在行首加 # 就是暂时不刷这个首领。",
+        "# 坐标用 BetterGI 的「启动/停止路径记录器」「添加路径点」快捷键记录：站在花旁边、能看到“接触征讨之花”的地方按一下，",
+        "# 日志里“已添加途径点(x,y)”括号里的两个数字就是坐标。",
+        "# 用记事本修改后保存即可，下次换首领时生效，不需要重新编译 BetterGI。",
+        "# 名单里一个名字都没有（全部加了 #）时，和以前一样：按“私服跳过的首领.txt”跳过首领。",
+        "",
+        "守望者·堕天                      # 花的头顶有宝箱图标",
+        "蕴光月守宫               5227.94921875, 3953.0380859375",
+        "深黯魇语之主             10366.8671875, 6412.3564453125",
+        "超重型陆巡舰·机动战垒    2792.3759765625, 4351.5",
+        "蕴光月幻蝶               2784.0234375, 4286.7412109375",
+        "重拳出击鸭               10050.4111328125, 1475.7587890625",
+        "熔岩辉龙像               9923.4033203125, -2247.501953125",
+        "灵觉隐修的迷者           9535.8359375, -1899.58203125",
+        "深邃摹结株                       # 花的头顶有宝箱图标",
+        "金焰绒翼龙暴君           8951.369140625, -1431.5078125",
+        "水形幻人                 4834, 4681.5830078125",
+        "铁甲熔火帝皇             4399.2236328125, 2171.8271484375",
+        "翠翎恐蕈                         # 花的头顶有宝箱图标",
+        "急冻树                           # 花的头顶有宝箱图标",
+        "爆炎树                           # 花的头顶有宝箱图标",
+    ];
+
+    /// <summary>刷取名单里的一个首领：名字（去掉空格和“·”等符号）和征讨之花的坐标（没写坐标时为 null）。（第 14 版）</summary>
+    private sealed record PrivateServerFarmEntry(string Name, double? X, double? Y);
+
+    /// <summary>最近一次读到的刷取名单（第 14 版）。</summary>
+    private List<PrivateServerFarmEntry> _psFarmList = [];
+
+    /// <summary>刷取名单里有名字（只刷名单里的首领）。（第 14 版）</summary>
+    private bool _psFarmListActive;
+
+    /// <summary>本次任务是否已经在日志里列出过刷取名单（第 14 版）。</summary>
+    private bool _psFarmListLogged;
     // ==================== 私服首领轮换 / 寻找无图标征讨之花（自定义修改）开关结束 ====================
 
     // ==================== 私服自动领取空月祝福（自定义修改）开关 ====================
@@ -284,6 +366,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         _psInterruptedBoss = null;
         _psLastRouteFinished = true;
         _psSkipListLogged = false;
+        _psFarmListLogged = false;
         Validate();
         LogScreenResolution();
 
@@ -396,11 +479,17 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             {
                 try
                 {
+                    // 私服（第 14 版）：把首领的位置告诉 BetterGI 的游泳检测：第一次检测到游泳时先游回首领那里接着打，第二次才回七天神像
+                    PrivateServerSetSwimBackPoint();
                     await RunAutoFight();
                 }
                 catch (RetryException e) when (PrivateServerRetryInterruptedRound)
                 {
                     psInterruptReason = $"战斗中被传送到了七天神像（{e.Message}）";
+                }
+                finally
+                {
+                    PrivateServerClearSwimBackPoint();
                 }
 
                 psInterruptReason ??= await PrivateServerCheckAwayFromBoss("打完后");
@@ -2770,9 +2859,17 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// 第 9 版（PrivateServerSlowScanForFlower）：原地转了几圈都没找到时，传送到首领附近的传送锚点、按 BetterGI 自带的路线重新跑到首领那里再找一次；
     /// 还找不到就设置 _psFlowerNotFound，由 RunBossLoop 换下一个首领。
     /// 关掉第 9 版时：超时找不到时（例如头顶没有图标、花在视野外），先回到首领路线终点附近，再找一次。
+    /// 第 14 版：刷取名单里记了征讨之花坐标的首领，直接走到坐标那里领（PrivateServerClaimFlowerAtPoint），不再转视角找。
     /// </summary>
     private async Task PrivateServerNavigateToReward()
     {
+        // 私服（第 14 版）：刷取名单里记了征讨之花坐标的首领（花的头顶没有宝箱图标），直接走到坐标那里领
+        if (PrivateServerGoToFlowerCoordinates && PrivateServerTryGetFlowerPoint(_taskParam.BossName, out var flowerX, out var flowerY))
+        {
+            await PrivateServerClaimFlowerAtPoint(flowerX, flowerY);
+            return;
+        }
+
         try
         {
             await NavigateToReward();
@@ -2810,6 +2907,516 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             await NavigateToReward();
         }
     }
+
+    // ==================== 私服第 14 版：刷取名单 / 走到记下的征讨之花坐标 / 游泳先游回首领（自定义修改）开始 ====================
+
+    /// <summary>
+    /// 读取刷取名单（User\私服刷取的首领.txt）。文件不存在时按默认内容创建；读取失败时使用默认名单。（第 14 版）
+    /// 每次换首领、找花、开打前都会重新读取，所以运行中修改名单，下次换首领时就会生效。
+    /// </summary>
+    private List<PrivateServerFarmEntry> PrivateServerLoadFarmList()
+    {
+        var path = Global.Absolute(PrivateServerFarmListFileName);
+        IEnumerable<string> lines;
+        try
+        {
+            if (!File.Exists(path))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllText(path, string.Join("\r\n", PrivateServerFarmListFileDefaultLines) + "\r\n", new System.Text.UTF8Encoding(true));
+                _logger.LogInformation("{Name}：已创建刷取名单：{Path}", Name, path);
+            }
+
+            lines = File.ReadAllLines(path);
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("{Name}：读取刷取名单失败（{Message}），使用默认名单", Name, e.Message);
+            lines = PrivateServerFarmListFileDefaultLines;
+        }
+
+        var list = PrivateServerParseFarmList(lines);
+        if (!_psFarmListLogged)
+        {
+            _psFarmListLogged = true;
+            if (list.Count == 0)
+            {
+                _logger.LogInformation("{Name}：刷取名单里没有首领，按跳过名单换首领（名单可以用记事本修改：{Path}）", Name, path);
+            }
+            else
+            {
+                _logger.LogInformation("{Name}：只刷刷取名单里的 {Count} 个首领：{List}（名单可以用记事本修改：{Path}）", Name, list.Count,
+                    string.Join("、", list.Select(entry => PrivateServerFarmDisplayName(entry.Name) + (entry.X.HasValue ? "（走到坐标）" : "（按宝箱图标找）"))), path);
+                foreach (var entry in list.Where(entry => !AutoBossData.SupportedBossNames.Any(supported => PrivateServerNormalizeBossName(supported) == entry.Name)))
+                {
+                    _logger.LogWarning("{Name}：刷取名单里的“{Boss}”不是 BetterGI 里的首领名字，不会刷到它，请检查有没有写错（名字要和冒险之证里的一样）", Name, entry.Name);
+                }
+            }
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// 解析刷取名单：每行一个首领，名字后面可以跟两个数字（征讨之花的 x、y 坐标）；# 或 ＃ 后面的内容不生效；
+    /// 名字里的空格和“·”等符号忽略。名字后面写“有”、冒号，或者从路线文件里复制来的 "x":…,"y":… 写法也认得。（第 14 版）
+    /// </summary>
+    private static List<PrivateServerFarmEntry> PrivateServerParseFarmList(IEnumerable<string> lines)
+    {
+        var list = new List<PrivateServerFarmEntry>();
+        foreach (var line in lines)
+        {
+            var text = line;
+            var comment = text.IndexOfAny(new[] { '#', '＃' });
+            if (comment >= 0)
+            {
+                text = text[..comment];
+            }
+
+            var match = PrivateServerFarmLineRegex.Match(text);
+            if (!match.Success)
+            {
+                continue;
+            }
+
+            var name = PrivateServerNormalizeBossName(match.Groups["name"].Value);
+            if (name.Length < 2 || list.Any(entry => entry.Name == name))
+            {
+                continue;
+            }
+
+            var numbers = new List<double>();
+            foreach (Match number in PrivateServerNumberRegex.Matches(match.Groups["rest"].Value))
+            {
+                if (double.TryParse(number.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+                {
+                    numbers.Add(value);
+                }
+            }
+
+            list.Add(numbers.Count >= 2 ? new PrivateServerFarmEntry(name, numbers[0], numbers[1]) : new PrivateServerFarmEntry(name, null, null));
+        }
+
+        return list;
+    }
+
+    /// <summary>刷取名单的一行：开头是首领名字（到空格、数字、冒号、逗号、引号、括号为止），后面是其他内容。（第 14 版）</summary>
+    private static readonly Regex PrivateServerFarmLineRegex = new(@"^\s*(?<name>[^\s\d:：,，""'(（\-+.]+)(?<rest>.*)$", RegexOptions.Compiled);
+
+    /// <summary>刷取名单里的数字（坐标）。（第 14 版）</summary>
+    private static readonly Regex PrivateServerNumberRegex = new(@"[-+]?\d+(?:\.\d+)?", RegexOptions.Compiled);
+
+    /// <summary>刷取名单里的名字在日志里怎么显示：对得上 BetterGI 里的首领时，用 BetterGI 里的写法（带“·”）。（第 14 版）</summary>
+    private static string PrivateServerFarmDisplayName(string name)
+    {
+        return AutoBossData.SupportedBossNames.FirstOrDefault(boss => PrivateServerNormalizeBossName(boss) == name) ?? name;
+    }
+
+    /// <summary>在刷取名单里找这个首领（名字去掉空格和“·”等符号后完全一样才算）。（第 14 版）</summary>
+    private static PrivateServerFarmEntry? PrivateServerFindFarmEntry(IReadOnlyList<PrivateServerFarmEntry> list, string boss)
+    {
+        var name = PrivateServerNormalizeBossName(boss);
+        return list.FirstOrDefault(entry => entry.Name == name);
+    }
+
+    /// <summary>刷取名单里有没有记下这个首领的征讨之花坐标。（第 14 版）</summary>
+    private bool PrivateServerTryGetFlowerPoint(string boss, out double x, out double y)
+    {
+        x = 0;
+        y = 0;
+        if (PrivateServerFindFarmEntry(PrivateServerLoadFarmList(), boss) is not { X: { } entryX, Y: { } entryY })
+        {
+            return false;
+        }
+
+        x = entryX;
+        y = entryY;
+        return true;
+    }
+
+    /// <summary>
+    /// 开打前把首领的位置告诉 BetterGI 的游泳检测（AutoFightTask.FightWaypoint）。（第 14 版）
+    /// BetterGI 在同一场战斗里第一次检测到游泳时，会过 0.8 秒再确认一次，然后朝这个位置游回去接着打（用过一次就清空），
+    /// 第二次检测到游泳才回七天神像。位置用首领“前往”路线的终点；没有路线坐标的首领（只能用键鼠宏走过去的）用刷取名单里记下的征讨之花坐标。
+    /// </summary>
+    private void PrivateServerSetSwimBackPoint()
+    {
+        if (!PrivateServerSwimBackToBossFirst)
+        {
+            return;
+        }
+
+        try
+        {
+            Waypoint? point = null;
+            var (mapName, matchMethod) = PrivateServerGetFlowerMap();
+            var routePath = BuildPathingAssetPath($"{_taskParam.BossName}前往.json");
+            if (File.Exists(routePath) && PathingTask.BuildFromFilePath(routePath)?.Positions.LastOrDefault() is { } end)
+            {
+                point = new Waypoint { X = end.X, Y = end.Y };
+            }
+            else if (PrivateServerTryGetFlowerPoint(_taskParam.BossName, out var flowerX, out var flowerY))
+            {
+                point = new Waypoint { X = flowerX, Y = flowerY };
+            }
+
+            AutoFightTask.FightWaypoint = point == null ? null : new WaypointForTrack(point, mapName, matchMethod);
+            if (point != null)
+            {
+                _logger.LogDebug("{Name}：战斗中第一次检测到游泳时，游回 ({X:F1}, {Y:F1})", Name, point.X, point.Y);
+            }
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            AutoFightTask.FightWaypoint = null;
+            _logger.LogDebug(e, "{Name}：设置游泳检测的回游位置失败，照常开打", Name);
+        }
+    }
+
+    /// <summary>打完后清空游泳检测的回游位置，不影响 BetterGI 的其他功能。（第 14 版）</summary>
+    private static void PrivateServerClearSwimBackPoint()
+    {
+        if (PrivateServerSwimBackToBossFirst)
+        {
+            AutoFightTask.FightWaypoint = null;
+        }
+    }
+
+    /// <summary>征讨之花坐标用哪张地图认位置：首领“前往”路线用的地图；没有路线时用提瓦特大陆。（第 14 版）</summary>
+    private (string MapName, string MatchMethod) PrivateServerGetFlowerMap()
+    {
+        var mapName = "Teyvat";
+        var matchMethod = TaskContext.Instance().Config.PathingConditionConfig.MapMatchingMethod;
+        try
+        {
+            var routePath = BuildPathingAssetPath($"{_taskParam.BossName}前往.json");
+            if (File.Exists(routePath) && PathingTask.BuildFromFilePath(routePath) is { } route)
+            {
+                if (!string.IsNullOrEmpty(route.Info.MapName))
+                {
+                    mapName = route.Info.MapName;
+                }
+
+                if (!string.IsNullOrEmpty(route.Info.MapMatchMethod))
+                {
+                    matchMethod = route.Info.MapMatchMethod;
+                }
+            }
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            _logger.LogDebug(e, "{Name}：读取首领路线的地图失败，按提瓦特大陆认位置", Name);
+        }
+
+        return (mapName, matchMethod);
+    }
+
+    /// <summary>
+    /// 走到刷取名单里记下的征讨之花坐标并领奖（第 14 版）。没找到时传送到附近的传送锚点、按路线重新跑到首领那里再走一次；
+    /// 还找不到就设置 _psFlowerNotFound，由 RunBossLoop 换下一个首领。
+    /// </summary>
+    private async Task PrivateServerClaimFlowerAtPoint(double x, double y)
+    {
+        if (await PrivateServerTryClaimFlowerAtPoint(x, y, ""))
+        {
+            return;
+        }
+
+        _logger.LogWarning("{Name}：在记下的坐标附近没有找到征讨之花，传送到附近的传送锚点，按路线重新跑到首领那里再走一次", Name);
+        if (!await EnsureCleanMainUi(new BvPage(_ct), "重新跑图前"))
+        {
+            _psFlowerNotFound = true;
+            return;
+        }
+
+        await NavigateToBoss();
+        if (await PrivateServerTryClaimFlowerAtPoint(x, y, "（重新跑图后）"))
+        {
+            return;
+        }
+
+        _logger.LogWarning("{Name}：重新跑图后在记下的坐标附近还是没有找到征讨之花，换下一个首领", Name);
+        _psFlowerNotFound = true;
+    }
+
+    /// <summary>
+    /// 走到记下的坐标上按交互键：先用 BetterGI 的寻路走到附近，再一小步一小步走到坐标上；坐标上没看到“接触征讨之花”时，
+    /// 在附近按“前进 1 步、右转、前进 2 步、右转……”绕圈找。（第 14 版）
+    /// </summary>
+    /// <returns>进了领奖界面，或者看到了“本周收取该宝藏次数已耗尽”时返回 true；没找到花时返回 false。</returns>
+    private async Task<bool> PrivateServerTryClaimFlowerAtPoint(double x, double y, string note)
+    {
+        var page = new BvPage(_ct);
+        // 刚打完时可能还在放技能的动画里，等一下游戏主界面（最多约 3 秒）
+        for (var wait = 0; wait < 6; wait++)
+        {
+            using var uiCapture = CaptureToRectArea();
+            if (Bv.IsInMainUi(uiCapture))
+            {
+                break;
+            }
+
+            await Delay(500, _ct);
+        }
+
+        if (HasRewardInteractionPrompt(page))
+        {
+            _logger.LogInformation("{Name}：已经看到“接触征讨之花”{Note}", Name, note);
+            if (await PrivateServerInteractWithFlower(TimeSpan.FromSeconds(3)))
+            {
+                return true;
+            }
+        }
+
+        var (mapName, matchMethod) = PrivateServerGetFlowerMap();
+        var map = BetterGenshinImpact.GameTask.Common.Map.Maps.MapManager.GetMap(mapName, matchMethod);
+        var target = map.ConvertGenshinMapCoordinatesToImageCoordinates(new Point2f((float)x, (float)y));
+        // 让小地图认位置时优先在坐标附近找（BetterGI 寻路时也是这样做的）
+        Navigation.SetPrevPosition(target.X, target.Y);
+        var here = PrivateServerReadGamePosition(map, mapName, matchMethod, stable: true);
+        if (here is not { } herePosition)
+        {
+            _logger.LogWarning("{Name}：小地图认不出当前位置，没法走到记下的征讨之花坐标{Note}", Name, note);
+            return await PrivateServerInteractWithFlower(TimeSpan.FromSeconds(2));
+        }
+
+        var distance = PrivateServerMeters(herePosition, x, y);
+        if (distance > PrivateServerFlowerPointMaxMeters)
+        {
+            _logger.LogWarning("{Name}：离记下的征讨之花坐标有 {Meters:F0} 米远，可能小地图认错了位置或者坐标记错了，不走过去{Note}", Name, distance, note);
+            return false;
+        }
+
+        _logger.LogInformation("{Name}：走到记下的征讨之花坐标（{X:F1}, {Y:F1}），离这里约 {Meters:F0} 米{Note}", Name, x, y, distance, note);
+        if (distance > 3)
+        {
+            await PrivateServerRunToPoint(x, y, mapName, matchMethod);
+        }
+
+        // 最后几步自己慢慢走到坐标上（BetterGI 的寻路走到离目标 2 米左右就停了），路上看到“接触征讨之花”就停下
+        await PrivateServerStepToPoint(map, mapName, matchMethod, x, y, TimeSpan.FromSeconds(8));
+        if (await PrivateServerInteractWithFlower(TimeSpan.FromSeconds(3)))
+        {
+            return true;
+        }
+
+        _logger.LogInformation("{Name}：坐标上没有看到“接触征讨之花”，在附近绕圈找（每步 {Step} 米，最远 {Max} 米）", Name,
+            PrivateServerFlowerSpiralStepMeters, PrivateServerFlowerSpiralMaxMeters);
+        foreach (var (pointX, pointY) in PrivateServerSpiralPoints(x, y))
+        {
+            if (await PrivateServerStepToPoint(map, mapName, matchMethod, pointX, pointY, TimeSpan.FromSeconds(5))
+                && await PrivateServerInteractWithFlower(TimeSpan.FromSeconds(3)))
+            {
+                return true;
+            }
+        }
+
+        return await PrivateServerInteractWithFlower(TimeSpan.FromSeconds(1));
+    }
+
+    /// <summary>两个原神坐标之间的距离（米）。（第 14 版）</summary>
+    private static double PrivateServerMeters(Point2f position, double x, double y)
+    {
+        return Math.Sqrt(Math.Pow(position.X - x, 2) + Math.Pow(position.Y - y, 2));
+    }
+
+    /// <summary>用小地图认出当前位置（原神坐标）；认不出时返回 null。（第 14 版）</summary>
+    private static Point2f? PrivateServerReadGamePosition(BetterGenshinImpact.GameTask.Common.Map.Maps.Base.ISceneMap map, string mapName, string matchMethod, bool stable)
+    {
+        using var capture = CaptureToRectArea();
+        var position = stable ? Navigation.GetPositionStable(capture, mapName, matchMethod) : Navigation.GetPosition(capture, mapName, matchMethod);
+        return position == default ? null : map.ConvertImageCoordinatesToGenshinMapCoordinates(position);
+    }
+
+    /// <summary>用 BetterGI 的寻路走到坐标附近（离目标 2 米左右）；中途不回七天神像回血、不切换队伍、不自动战斗。（第 14 版）</summary>
+    private async Task PrivateServerRunToPoint(double x, double y, string mapName, string matchMethod)
+    {
+        var task = new PathingTask
+        {
+            Info = new PathingTaskInfo
+            {
+                Name = $"{_taskParam.BossName}的征讨之花",
+                MapName = mapName,
+                MapMatchMethod = matchMethod
+            },
+            Positions = [new Waypoint { X = x, Y = y, Type = BetterGenshinImpact.GameTask.AutoPathing.Model.Enum.WaypointType.Target.Code }]
+        };
+        var partyConfig = BuildPathingPartyConfig();
+        partyConfig.RecoverTiming = RecoverTiming.Never;
+        var executor = new PathExecutor(_ct)
+        {
+            PartyConfig = partyConfig
+        };
+        try
+        {
+            await executor.Pathing(task);
+        }
+        catch (Exception e) when (e is not (OperationCanceledException or NormalEndException))
+        {
+            _logger.LogDebug(e, "{Name}：走向征讨之花坐标时出错，改为一小步一小步走", Name);
+        }
+        finally
+        {
+            Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+        }
+    }
+
+    /// <summary>
+    /// 一小步一小步走到坐标上（每一步都用小地图确认位置、把视角转向坐标），路上看到“接触征讨之花”就停下；
+    /// 离坐标 PrivateServerFlowerPointArriveMeters 米以内、走不动了（被挡住）或者超时就不走了。（第 14 版）
+    /// </summary>
+    /// <returns>看到了“接触征讨之花”时返回 true。</returns>
+    private async Task<bool> PrivateServerStepToPoint(BetterGenshinImpact.GameTask.Common.Map.Maps.Base.ISceneMap map, string mapName, string matchMethod,
+        double x, double y, TimeSpan maxTime)
+    {
+        var page = new BvPage(_ct);
+        var rotateTask = new CameraRotateTask(_ct);
+        var target = map.ConvertGenshinMapCoordinatesToImageCoordinates(new Point2f((float)x, (float)y));
+        var targetWaypoint = new Waypoint { X = target.X, Y = target.Y };
+        var stopwatch = Stopwatch.StartNew();
+        var misses = 0;
+        var noProgress = 0;
+        double? lastDistance = null;
+        try
+        {
+            while (stopwatch.Elapsed < maxTime)
+            {
+                if (HasRewardInteractionPrompt(page))
+                {
+                    return true;
+                }
+
+                using var capture = CaptureToRectArea();
+                var position = Bv.IsInMainUi(capture) ? Navigation.GetPosition(capture, mapName, matchMethod) : default;
+                if (position == default || map.ConvertImageCoordinatesToGenshinMapCoordinates(position) is not { } game)
+                {
+                    if (++misses > 6)
+                    {
+                        break;
+                    }
+
+                    await Delay(250, _ct);
+                    continue;
+                }
+
+                misses = 0;
+                var distance = PrivateServerMeters(game, x, y);
+                if (distance <= PrivateServerFlowerPointArriveMeters)
+                {
+                    break;
+                }
+
+                // 连续几步都没有靠近：被石头、墙之类的挡住了，不走了
+                if (lastDistance is { } last && last - distance < 0.15)
+                {
+                    if (++noProgress >= 4)
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    noProgress = 0;
+                }
+
+                lastDistance = distance;
+                await rotateTask.WaitUntilRotatedTo(Navigation.GetTargetOrientation(targetWaypoint, position), 6, 20);
+                var holdMs = distance > 4 ? 400 : distance > 2 ? 200 : 90;
+                Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
+                await Delay(holdMs, _ct);
+                Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+                await Delay(80, _ct);
+            }
+        }
+        finally
+        {
+            Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
+        }
+
+        return HasRewardInteractionPrompt(page);
+    }
+
+    /// <summary>
+    /// 坐标附近绕圈找的路线：从坐标出发，前进 1 步、右转、前进 2 步、右转、前进 3 步……（每步 PrivateServerFlowerSpiralStepMeters 米），
+    /// 离坐标最远 PrivateServerFlowerSpiralMaxMeters 米。返回每一段的终点（原神坐标）。（第 14 版）
+    /// </summary>
+    private static IEnumerable<(double X, double Y)> PrivateServerSpiralPoints(double x, double y)
+    {
+        var step = PrivateServerFlowerSpiralStepMeters;
+        var max = PrivateServerFlowerSpiralMaxMeters;
+        (int X, int Y)[] directions = [(0, 1), (1, 0), (0, -1), (-1, 0)];
+        double dx = 0, dy = 0;
+        for (var leg = 1; leg <= 12; leg++)
+        {
+            var direction = directions[(leg - 1) % 4];
+            dx += direction.X * leg * step;
+            dy += direction.Y * leg * step;
+            yield return (x + Math.Clamp(dx, -max, max), y + Math.Clamp(dy, -max, max));
+            if (Math.Abs(dx) >= max && Math.Abs(dy) >= max)
+            {
+                yield break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 在征讨之花旁边按交互键领奖：看到“接触征讨之花”就按交互键，进了领奖界面（或者提示“本周收取该宝藏次数已耗尽”，
+    /// 或者按了 3 次都没反应）时返回 true；等了 waitForPrompt 还没看到提示时返回 false。按键和判断都和原来找花时一样（MonitorRewardPromptTask）。（第 14 版）
+    /// </summary>
+    private async Task<bool> PrivateServerInteractWithFlower(TimeSpan waitForPrompt)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_ct);
+        var page = new BvPage(cts.Token);
+        Interlocked.Exchange(ref _psRewardPromptSeenTicks, 0);
+        var monitor = MonitorRewardPromptTask(page, cts);
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            while (true)
+            {
+                if (await Task.WhenAny(monitor, Task.Delay(250, _ct)) == monitor)
+                {
+                    await monitor;
+                    if (_psWeeklyLimitReached)
+                    {
+                        _logger.LogInformation("{Name}：征讨之花提示“本周收取该宝藏次数已耗尽”", Name);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("{Name}：已进入征讨之花领奖界面", Name);
+                    }
+
+                    return true;
+                }
+
+                var promptSeen = Interlocked.Read(ref _psRewardPromptSeenTicks) != 0;
+                if (!promptSeen && stopwatch.Elapsed >= waitForPrompt)
+                {
+                    return false;
+                }
+
+                if (stopwatch.Elapsed >= waitForPrompt + TimeSpan.FromSeconds(12))
+                {
+                    _logger.LogWarning("{Name}：按了交互键一直没有弹出领奖界面", Name);
+                    return false;
+                }
+            }
+        }
+        finally
+        {
+            cts.Cancel();
+            try
+            {
+                await monitor;
+            }
+            catch (Exception) when (!_ct.IsCancellationRequested)
+            {
+                // 是这里自己停掉的（不是任务被停止），不用管
+            }
+        }
+    }
+
+    // ==================== 私服第 14 版（自定义修改）结束 ====================
 
     /// <summary>
     /// 走到当前首领“前往”路线的终点（首领所在位置）。
@@ -3046,12 +3653,16 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// <summary>
     /// 在冒险之证“讨伐 → 首领”列表里选择要讨伐的首领，并（按开关）点击“前往”→“传送并追踪”。
     /// 会跳过：需要先完成前置任务的、在跳过名单里的、BetterGI 不支持的、附近没有解锁传送锚点的首领。
+    /// 第 14 版：刷取名单（User\私服刷取的首领.txt）里有名字时，只选名单里的首领，跳过名单不再使用。
     /// </summary>
     /// <param name="advance">false：使用红框标记的首领（不能刷时往后找）；true：从红框标记的下一个首领开始找。</param>
     /// <returns>选中的首领名称；列表已经到末尾或操作失败时返回 null。</returns>
     private async Task<string?> PrivateServerSelectBossInHandbook(bool advance)
     {
-        var skipList = PrivateServerLoadSkippedBosses();
+        // 私服（第 14 版）：刷取名单里有名字时，只刷名单里的首领（不在名单里的都跳过），不再使用跳过名单
+        _psFarmList = PrivateServerUseFarmList ? PrivateServerLoadFarmList() : new List<PrivateServerFarmEntry>();
+        _psFarmListActive = _psFarmList.Count > 0;
+        IReadOnlyList<string> skipList = _psFarmListActive ? Array.Empty<string>() : PrivateServerLoadSkippedBosses();
         var reopened = false;
         string? cappedBoss = null;
         var welkinRetries = 0;
@@ -3241,6 +3852,13 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         }
 
         var boss = title == null ? null : PrivateServerMatchSupportedBoss(title);
+        // 私服（第 14 版）：刷取名单里有名字时，不在名单里的首领直接跳过
+        if (_psFarmListActive && boss != null && PrivateServerFindFarmEntry(_psFarmList, boss) == null)
+        {
+            _logger.LogInformation("{Name}：不在刷取名单里，跳过首领：{Boss}", Name, boss);
+            return (PrivateServerCandidateResult.Skip, null);
+        }
+
         if (PrivateServerFindSkipKeyword(skipList, title, boss) != null)
         {
             _logger.LogInformation("{Name}：按跳过名单跳过首领：{Title}", Name, boss ?? title);
@@ -3972,7 +4590,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// 视角回正后再往下看多少度（第 10 版）。数字越大，画面里地面越多、干扰越少，但看到的范围越近，
     /// 太大时离得稍远的花会看不到（往下看到底时只能看到身边 5 米左右）。
     /// </summary>
-    private const double PrivateServerLookDownDegrees = 65;
+    private const double PrivateServerLookDownDegrees = 25;
 
     /// <summary>一次找花最多朝几个目标走过去；都没有走到花跟前，就当作这次没找到，免得被认错的东西带着到处走（第 10 版）。</summary>
     private const int PrivateServerMaxApproachAttempts = 4;
