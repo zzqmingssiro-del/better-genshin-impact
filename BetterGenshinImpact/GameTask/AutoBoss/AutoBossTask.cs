@@ -93,6 +93,8 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     // 容易摔下山或者和神像交互卡住），重新前往同一个首领再打；打完后也会用小地图确认角色还在首领附近。
     // 第 14 版：只刷“刷取名单”（User\私服刷取的首领.txt）里写了的首领；征讨之花头顶没有宝箱图标的首领，打完后直接走到名单里记下的花的坐标去领，
     // 不再按像素找花（头顶有宝箱图标的花还是原地转视角按图标找）；战斗中第一次检测到游泳时先游回首领那里接着打，第二次才回七天神像。
+    // 第 15 版：找征讨之花期间（包括没找到花时传送回来重新跑路线），BetterGI 寻路不切换盾、回血角色放元素战技
+    // （例如钟离会松开 W、按 S、长按 E 往身后放柱子，打乱走向）；走去花坐标时真正不回七天神像回血；最后几米小步走更稳。
     // 下面几个开关改完需要重新编译。
 
     /// <summary>征讨之花提示“本周收取该宝藏次数已耗尽”时，是否按冒险之证首领列表顺序自动换下一个首领继续讨伐（关闭时直接结束任务）。</summary>
@@ -243,6 +245,20 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// </summary>
     private static readonly bool PrivateServerSwimBackToBossFirst = true;
 
+    /// <summary>
+    /// 找征讨之花期间（打完走去记下的坐标、没找到花时传送回来重新跑路线），BetterGI 寻路是否不切换盾、回血角色放元素战技（第 15 版）。
+    /// 地图追踪的条件配置里给角色设了“循环长E / 循环短E”（例如钟离）时，BetterGI 寻路离目标超过 10 米就会切到这个角色放 E，
+    /// 钟离还会先松开 W、按一下 S 转身，把柱子放在身后。找花时附近没有怪，不需要护盾，切人、转身、长按 E 反而会打乱走向，柱子也可能挡路。
+    /// 改成 false：恢复第 14 版的做法（找花时也放）。跑去打首领的路线、战斗中都不受这个开关影响，照常放。
+    /// </summary>
+    private static readonly bool PrivateServerNoGuardianSkillWhenFindingFlower = true;
+
+    /// <summary>正在找征讨之花（第 15 版）：这期间 BetterGI 寻路不切换盾、回血角色放元素战技。</summary>
+    private volatile bool _psFindingFlower;
+
+    /// <summary>本次任务是否已经在日志里提示过“找花时不放盾”（第 15 版）。</summary>
+    private bool _psNoGuardianLogged;
+
     /// <summary>刷取名单文件（第 14 版）。用记事本修改后保存即可，下次换首领时生效，不需要重新编译。</summary>
     private const string PrivateServerFarmListFileName = @"User\私服刷取的首领.txt";
 
@@ -367,6 +383,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         _psLastRouteFinished = true;
         _psSkipListLogged = false;
         _psFarmListLogged = false;
+        _psNoGuardianLogged = false;
         Validate();
         LogScreenResolution();
 
@@ -1477,7 +1494,10 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     {
         var executor = new PathExecutor(_ct)
         {
-            PartyConfig = BuildPathingPartyConfig()
+            // 私服（第 15 版）：找征讨之花期间（没找到花、传送回来重新跑路线时）不切换盾、回血角色放元素战技
+            PartyConfig = _psFindingFlower && PrivateServerNoGuardianSkillWhenFindingFlower
+                ? await PrivateServerBuildFlowerPartyConfig(noGuardian: true, neverRecover: false)
+                : BuildPathingPartyConfig()
         };
         await executor.Pathing(task);
         // 私服（第 11 版）：记下这条路线有没有完整跑完（例如中途回七天神像回血、多次卡住后放弃），开打前会确认角色是否在首领附近
@@ -2863,6 +2883,21 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
     /// </summary>
     private async Task PrivateServerNavigateToReward()
     {
+        // 私服（第 15 版）：找征讨之花期间（包括没找到花时传送回来重新跑路线），BetterGI 寻路不切换盾、回血角色放元素战技
+        _psFindingFlower = true;
+        try
+        {
+            await PrivateServerNavigateToRewardCore();
+        }
+        finally
+        {
+            _psFindingFlower = false;
+        }
+    }
+
+    /// <summary>找征讨之花的具体做法（第 15 版从 PrivateServerNavigateToReward 拆出来，内容和第 14 版一样）。</summary>
+    private async Task PrivateServerNavigateToRewardCore()
+    {
         // 私服（第 14 版）：刷取名单里记了征讨之花坐标的首领（花的头顶没有宝箱图标），直接走到坐标那里领
         if (PrivateServerGoToFlowerCoordinates && PrivateServerTryGetFlowerPoint(_taskParam.BossName, out var flowerX, out var flowerY))
         {
@@ -3228,7 +3263,51 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         return position == default ? null : map.ConvertImageCoordinatesToGenshinMapCoordinates(position);
     }
 
-    /// <summary>用 BetterGI 的寻路走到坐标附近（离目标 2 米左右）；中途不回七天神像回血、不切换队伍、不自动战斗。（第 14 版）</summary>
+    /// <summary>
+    /// 找征讨之花时 BetterGI 寻路用的队伍配置（第 15 版）：和平时一样按地图追踪的条件配置生成（行走位等照旧），
+    /// 不切换队伍、不自动战斗，并标记为“已启用”，让 BetterGI 寻路直接使用、不再按条件配置重新生成。
+    /// </summary>
+    /// <param name="noGuardian">去掉条件配置里“循环长E / 循环短E”的角色：寻路时不切换盾、回血角色放元素战技。</param>
+    /// <param name="neverRecover">中途不回七天神像回血。</param>
+    private async Task<PathingPartyConfig> PrivateServerBuildFlowerPartyConfig(bool noGuardian, bool neverRecover)
+    {
+        PathingPartyConfig config;
+        try
+        {
+            var combatScenes = await RunnerContext.Instance.GetCombatScenes(_ct);
+            config = combatScenes == null
+                ? PathingPartyConfig.BuildDefault()
+                : TaskContext.Instance().Config.PathingConditionConfig.BuildPartyConfigByCondition(combatScenes);
+        }
+        catch (Exception e) when (e is not (OperationCanceledException or NormalEndException))
+        {
+            _logger.LogDebug(e, "{Name}：按地图追踪的条件配置生成队伍配置失败，改用默认配置", Name);
+            config = PathingPartyConfig.BuildDefault();
+        }
+
+        config.Enabled = true;
+        config.SkipPartySwitch = true;
+        config.AutoFightEnabled = false;
+        if (noGuardian && !string.IsNullOrEmpty(config.GuardianAvatarIndex))
+        {
+            if (!_psNoGuardianLogged)
+            {
+                _psNoGuardianLogged = true;
+                _logger.LogInformation("{Name}：找征讨之花时，寻路不切换盾、回血角色（{Index} 号）放元素战技", Name, config.GuardianAvatarIndex);
+            }
+
+            config.GuardianAvatarIndex = string.Empty;
+        }
+
+        if (neverRecover)
+        {
+            config.RecoverTiming = RecoverTiming.Never;
+        }
+
+        return config;
+    }
+
+    /// <summary>用 BetterGI 的寻路走到坐标附近（离目标 2 米左右）；中途不回七天神像回血、不切换队伍、不自动战斗；第 15 版起也不放盾。（第 14 版）</summary>
     private async Task PrivateServerRunToPoint(double x, double y, string mapName, string matchMethod)
     {
         var task = new PathingTask
@@ -3241,8 +3320,9 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
             },
             Positions = [new Waypoint { X = x, Y = y, Type = BetterGenshinImpact.GameTask.AutoPathing.Model.Enum.WaypointType.Target.Code }]
         };
-        var partyConfig = BuildPathingPartyConfig();
-        partyConfig.RecoverTiming = RecoverTiming.Never;
+        // 第 15 版：队伍配置是“未启用”时，BetterGI 寻路会按地图追踪的条件配置重新生成一份，第 14 版设的“不回七天神像回血”会被换掉，
+        // 条件配置里“循环长E / 循环短E”的角色也会照常切过去放 E（钟离还会按 S 转身），所以这里直接给它一份“已启用”的配置
+        var partyConfig = await PrivateServerBuildFlowerPartyConfig(noGuardian: PrivateServerNoGuardianSkillWhenFindingFlower, neverRecover: true);
         var executor = new PathExecutor(_ct)
         {
             PartyConfig = partyConfig
@@ -3263,7 +3343,7 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
 
     /// <summary>
     /// 一小步一小步走到坐标上（每一步都用小地图确认位置、把视角转向坐标），路上看到“接触征讨之花”就停下；
-    /// 离坐标 PrivateServerFlowerPointArriveMeters 米以内、走不动了（被挡住）或者超时就不走了。（第 14 版）
+    /// 离坐标 PrivateServerFlowerPointArriveMeters 米以内、走不动了（被挡住）或者超时就不走了。（第 14 版；第 15 版改了被挡住的判断和近处的步长）
     /// </summary>
     /// <returns>看到了“接触征讨之花”时返回 true。</returns>
     private async Task<bool> PrivateServerStepToPoint(BetterGenshinImpact.GameTask.Common.Map.Maps.Base.ISceneMap map, string mapName, string matchMethod,
@@ -3275,8 +3355,9 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
         var targetWaypoint = new Waypoint { X = target.X, Y = target.Y };
         var stopwatch = Stopwatch.StartNew();
         var misses = 0;
-        var noProgress = 0;
-        double? lastDistance = null;
+        var bestDistance = double.MaxValue;
+        var bestAt = TimeSpan.Zero;
+        var budgetSet = false;
         try
         {
             while (stopwatch.Elapsed < maxTime)
@@ -3306,22 +3387,28 @@ public class AutoBossTask : ISoloTask<Dictionary<string, int>>
                     break;
                 }
 
-                // 连续几步都没有靠近：被石头、墙之类的挡住了，不走了
-                if (lastDistance is { } last && last - distance < 0.15)
+                // 第 15 版：离坐标还远时（例如前面寻路没走到）按距离多给一点时间，大约每米 0.5 秒，最多 30 秒
+                if (!budgetSet)
                 {
-                    if (++noProgress >= 4)
-                    {
-                        break;
-                    }
-                }
-                else
-                {
-                    noProgress = 0;
+                    budgetSet = true;
+                    maxTime = TimeSpan.FromSeconds(Math.Min(30, Math.Max(maxTime.TotalSeconds, 3 + distance * 0.5)));
                 }
 
-                lastDistance = distance;
-                await rotateTask.WaitUntilRotatedTo(Navigation.GetTargetOrientation(targetWaypoint, position), 6, 20);
-                var holdMs = distance > 4 ? 400 : distance > 2 ? 200 : 90;
+                // 第 15 版：2.5 秒内一直没有比之前最近的时候再靠近 0.3 米，才算被石头、墙、柱子之类的挡住了，不走了
+                // （第 14 版是连续 4 步都没靠近 0.15 米就停，离得近时每步走得短、小地图读数又有一点误差，容易提前停下）
+                if (distance < bestDistance - 0.3)
+                {
+                    bestDistance = distance;
+                    bestAt = stopwatch.Elapsed;
+                }
+                else if (stopwatch.Elapsed - bestAt > TimeSpan.FromSeconds(2.5))
+                {
+                    break;
+                }
+
+                // 第 15 版：2 米以内位置的小误差会让方向来回变，转视角允许的误差放宽到 15 度；近处每步 0.12 秒（第 14 版 6 度、0.09 秒）
+                await rotateTask.WaitUntilRotatedTo(Navigation.GetTargetOrientation(targetWaypoint, position), distance < 2 ? 15 : 6, 20);
+                var holdMs = distance > 4 ? 400 : distance > 2 ? 200 : 120;
                 Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
                 await Delay(holdMs, _ct);
                 Simulation.SendInput.SimulateAction(GIActions.MoveForward, KeyType.KeyUp);
