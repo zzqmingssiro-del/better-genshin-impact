@@ -85,6 +85,30 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
 
     // ==================== 私服：自动秘境不等秘境提示（自定义修改）开关结束 ====================
 
+    // ==================== 私服第 16 版：枫丹、纳塔、挪德卡莱的秘境原地领奖（自定义修改）开关 ====================
+
+    /// <summary>
+    /// 枫丹、纳塔、挪德卡莱的秘境打完后，不找石化古树，原地按 F 领奖（第 16 版）。
+    /// 这几个地区的秘境在私服上有问题：石化古树不在后面的台阶上，而是在下面；打完后钥匙不消失，对准古树时钥匙会挡住古树。
+    /// 需要战斗策略在开打时就走到古树的位置（你已经在战斗脚本里改好了）。原地没看到交互键时，还是用原来的方法找古树。
+    /// 改成 false：恢复原来的做法（打完后先找石化古树再走过去）。修改后需要重新编译。
+    /// </summary>
+    private static readonly bool PrivateServerClaimRewardAtSpot = true;
+
+    /// <summary>哪些地区的秘境打完后原地按 F 领奖（第 16 版）。写法和 BetterGI 秘境列表里的“国家”一样。</summary>
+    private static readonly string[] PrivateServerClaimAtSpotCountries = ["枫丹", "纳塔", "挪德卡莱"];
+
+    /// <summary>打完后最多等几秒，看原地有没有交互键（第 16 版）；等不到就改用原来的方法找石化古树。</summary>
+    private const int PrivateServerClaimAtSpotWaitSeconds = 5;
+
+    /// <summary>钥匙的交互文字（第 16 版）：原地或者走向石化古树时，交互键旁边写的是这个就不按 F，免得又启动了钥匙。</summary>
+    private const string PrivateServerKeyPromptText = "启动";
+
+    /// <summary>这次挂机的秘境是不是要原地领奖（第 16 版，进入秘境后判断一次）。</summary>
+    private bool _psClaimAtSpot;
+
+    // ==================== 私服第 16 版：枫丹、纳塔、挪德卡莱的秘境原地领奖（自定义修改）开关结束 ====================
+
     private readonly string challengeCompletedLocalizedString;
     private readonly string autoLeavingLocalizedString;
     private readonly string skipLocalizedString;
@@ -271,6 +295,9 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
         // 前置进入秘境
         await EnterDomain();
 
+        // 私服（第 16 版）：枫丹、纳塔、挪德卡莱的秘境打完后不找石化古树，原地按 F 领奖
+        _psClaimAtSpot = PrivateServerShouldClaimAtSpot();
+
         var combatScenes = new CombatScenes();
         for (var i = 0; i < _taskParam.DomainRoundNum; i++)
         {
@@ -342,13 +369,17 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
             }
             EndFightWait();
 
-            // 3. 寻找石化古树 并左右移动直到石化古树位于屏幕中心
-            Logger.LogInformation("自动秘境：{Text}", "3. 寻找石化古树");
-            await FindPetrifiedTree();
+            // 私服（第 16 版）：枫丹、纳塔、挪德卡莱的秘境打完后不找石化古树，原地按 F 领奖；没成功再用原来的方法（第 3、4 步）
+            if (!_psClaimAtSpot || !await PrivateServerClaimAtSpot())
+            {
+                // 3. 寻找石化古树 并左右移动直到石化古树位于屏幕中心
+                Logger.LogInformation("自动秘境：{Text}", "3. 寻找石化古树");
+                await FindPetrifiedTree();
 
-            // 4. 走到石化古树处
-            Logger.LogInformation("自动秘境：{Text}", "4. 走到石化古树处");
-            await WalkToPressF();
+                // 4. 走到石化古树处（私服第 16 版：这几个地区的秘境，走过去时不按钥匙的“启动”）
+                Logger.LogInformation("自动秘境：{Text}", "4. 走到石化古树处");
+                await WalkToPressF(_psClaimAtSpot);
+            }
 
             // 5. 快速领取奖励并判断是否有下一轮
             Logger.LogInformation("自动秘境：{Text}", "5. 领取奖励");
@@ -835,6 +866,160 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
 
     // ==================== 私服：自动秘境不等秘境提示（自定义修改）结束 ====================
 
+    // ==================== 私服第 16 版：枫丹、纳塔、挪德卡莱的秘境原地领奖（自定义修改）开始 ====================
+
+    /// <summary>
+    /// 私服（第 16 版）：这次挂机的秘境是不是要打完后原地领奖：秘境在 PrivateServerClaimAtSpotCountries 里的地区
+    /// （按 BetterGI 秘境列表里的“国家”判断，和传送到秘境用的是同一个名字）。
+    /// </summary>
+    private bool PrivateServerShouldClaimAtSpot()
+    {
+        if (!PrivateServerClaimRewardAtSpot)
+        {
+            return false;
+        }
+
+        var domainName = _guideDomainName ?? _taskParam.DomainName;
+        if (string.IsNullOrEmpty(domainName))
+        {
+            Logger.LogInformation("自动秘境：没有选择秘境名称，不知道秘境在哪个地区，打完后按原来的方法找石化古树");
+            return false;
+        }
+
+        var country = MapLazyAssets.Get().GetCountryByDomain(domainName);
+        if (string.IsNullOrEmpty(country) || !PrivateServerClaimAtSpotCountries.Contains(country))
+        {
+            return false;
+        }
+
+        Logger.LogInformation("自动秘境：{Domain}在{Country}，打完后不找石化古树，原地按 F 领奖（私服）", domainName, country);
+        return true;
+    }
+
+    /// <summary>
+    /// 私服（第 16 版）：打完后不找石化古树，原地按 F 领奖（战斗策略开打时已经走到了古树的位置）。
+    /// 1. 最多等 PrivateServerClaimAtSpotWaitSeconds 秒，看原地有没有交互键；
+    /// 2. 交互键旁边写的是钥匙的“启动”时不按（私服打完后钥匙不消失），滚一下鼠标滚轮，看看能不能换到古树的选项；
+    /// 3. 按 F 以后确认弹出了石化古树的领奖框（或者直接到了“继续挑战”的界面），没弹出就再按一次。
+    /// 成功返回 true；返回 false 时改用原来的方法找石化古树。
+    /// </summary>
+    private async Task<bool> PrivateServerClaimAtSpot()
+    {
+        var deadline = DateTime.Now.AddSeconds(PrivateServerClaimAtSpotWaitSeconds);
+        var scrolled = false;
+        var presses = 0;
+        while (DateTime.Now < deadline && presses < 2)
+        {
+            var pressed = false;
+            using (var ra = CaptureToRectArea())
+            {
+                var pickAssets = AutoPickAssets.Get(ra, TaskContext.Instance().Config.AutoPickConfig.PickKey);
+                using var fRect = ra.Find(pickAssets.PickRo);
+                if (!fRect.IsEmpty())
+                {
+                    var promptText = PrivateServerReadPromptText(ra, fRect);
+                    if (!PrivateServerIsKeyPrompt(promptText))
+                    {
+                        Logger.LogInformation("自动秘境：原地看到交互键（{Text}），按 F 领奖（私服：不找石化古树）",
+                            string.IsNullOrEmpty(promptText) ? "文字没认出来" : promptText);
+                        Simulation.SendInput.Keyboard.KeyPress(pickAssets.PickVk);
+                        presses++;
+                        pressed = true;
+                    }
+                    else if (!scrolled)
+                    {
+                        // 古树和钥匙都在旁边时会有两个选项，滚一下鼠标滚轮换到另一个
+                        scrolled = true;
+                        Logger.LogInformation("自动秘境：原地的交互键是钥匙的“{Text}”，滚一下鼠标滚轮换一个选项", promptText);
+                        Simulation.SendInput.Mouse.VerticalScroll(-1);
+                    }
+                    else
+                    {
+                        Logger.LogWarning("自动秘境：原地只有钥匙的“{Text}”，不按 F，改用原来的方法找石化古树", promptText);
+                        return false;
+                    }
+                }
+            }
+
+            if (pressed)
+            {
+                if (await PrivateServerWaitForTreePopup())
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            await Delay(300, _ct);
+        }
+
+        Logger.LogWarning(presses > 0
+            ? "自动秘境：按了 F 但没有弹出石化古树的领奖框，改用原来的方法找石化古树"
+            : "自动秘境：原地没有看到交互键（可能没站在石化古树旁边），改用原来的方法找石化古树");
+        return false;
+    }
+
+    /// <summary>
+    /// 私服（第 16 版）：按 F 以后最多等 3 秒，看有没有弹出石化古树的领奖框（和 GettingTreasure 一样认“石化古树”这几个字），
+    /// 或者直接到了有“继续挑战”按钮的界面（只有原粹树脂时不弹框）。
+    /// </summary>
+    private async Task<bool> PrivateServerWaitForTreePopup()
+    {
+        for (var i = 0; i < 10; i++)
+        {
+            await Delay(300, _ct);
+            using var ra = CaptureToRectArea();
+            var textList = ra.FindMulti(RecognitionObject.Ocr(ra.Width * 0.25, ra.Height * 0.2, ra.Width * 0.5, ra.Height * 0.6));
+            if (textList.Any(t => Regex.IsMatch(t.Text, petrifiedTreeString)))
+            {
+                return true;
+            }
+
+            using var confirmRectArea = ra.Find(RecognitionAssets.Get("AutoFight", "Confirm", ra));
+            if (!confirmRectArea.IsEmpty())
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 私服（第 16 版）：读交互键旁边的文字。位置和 BetterGI 自动拾取认文字的位置一样（1080P 下交互键左边往右 115～400 像素）。
+    /// 认不出来时返回空字符串。
+    /// </summary>
+    private static string PrivateServerReadPromptText(ImageRegion ra, BetterGenshinImpact.GameTask.Model.Area.Region fRect)
+    {
+        try
+        {
+            var scale = TaskContext.Instance().SystemInfo.AssetScale;
+            var x = fRect.X + (int)(115 * scale);
+            var width = Math.Min((int)(285 * scale), ra.SrcMat.Width - x);
+            if (width <= 10 || fRect.Height <= 5 || fRect.Y < 0 || fRect.Y + fRect.Height > ra.SrcMat.Height)
+            {
+                return string.Empty;
+            }
+
+            using var textMat = new Mat(ra.SrcMat, new OpenCvSharp.Rect(x, fRect.Y, width, fRect.Height));
+            return OcrFactory.Paddle.Ocr(textMat).Trim();
+        }
+        catch (Exception e)
+        {
+            Logger.LogDebug(e, "自动秘境：读交互键旁边的文字失败");
+            return string.Empty;
+        }
+    }
+
+    /// <summary>私服（第 16 版）：交互键旁边的文字是不是钥匙的“启动”。</summary>
+    private static bool PrivateServerIsKeyPrompt(string promptText)
+    {
+        return !string.IsNullOrEmpty(promptText) && promptText.Contains(PrivateServerKeyPromptText);
+    }
+
+    // ==================== 私服第 16 版：枫丹、纳塔、挪德卡莱的秘境原地领奖（自定义修改）结束 ====================
+
     private List<CombatCommand> FindCombatScriptAndSwitchAvatar(CombatScenes combatScenes)
     {
         var combatCommands = _combatScriptBag.FindCombatScript(combatScenes.GetAvatars());
@@ -847,7 +1032,8 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
     /// <summary>
     /// 走到钥匙处启动
     /// </summary>
-    private async Task WalkToPressF()
+    /// <param name="privateServerSkipKeyPrompt">私服（第 16 版）：交互键旁边写的是钥匙的“启动”时不按 F，继续往前走（走向石化古树时用）。</param>
+    private async Task WalkToPressF(bool privateServerSkipKeyPrompt = false)
     {
         if (_ct.IsCancellationRequested)
         {
@@ -872,7 +1058,8 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
                     using var gameCaptureRegion = Common.TaskControl.CaptureToRectArea();
                     var pickAssets = AutoPickAssets.Get(gameCaptureRegion, TaskContext.Instance().Config.AutoPickConfig.PickKey);
                     using var fRectArea = gameCaptureRegion.Find(pickAssets.PickRo);
-                    if (fRectArea.IsEmpty())
+                    // 私服（第 16 版）：走向石化古树时，钥匙的“启动”当作没看到交互键，继续往前走（超时判断照常）
+                    if (fRectArea.IsEmpty() || (privateServerSkipKeyPrompt && PrivateServerIsKeyPrompt(PrivateServerReadPromptText(gameCaptureRegion, fRectArea))))
                     {
                         Sleep(100, _ct);
                     }
